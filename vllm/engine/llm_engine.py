@@ -57,6 +57,8 @@ from vllm.utils import Counter, Device, resolve_obj_by_qualname, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.worker.model_runner_base import InputProcessingError
 
+from vllm.instrumentation.kv_baseline import KVMetricsCollector, KVMetricsConfig
+
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
@@ -196,6 +198,8 @@ class LLMEngine:
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
+        kv_metrics: str = "off",
+        kv_metrics_path: str = None,
     ) -> None:
         if envs.VLLM_USE_V1:
             raise ValueError(
@@ -371,6 +375,54 @@ class LLMEngine:
             self.tracer = init_tracer(
                 "vllm.llm_engine",
                 self.observability_config.otlp_traces_endpoint)
+        
+        # Build metrics config
+        self._kv_cfg = KVMetricsConfig(mode=kv_metrics, out_path=kv_metrics_path)
+        self._kv_metrics = KVMetricsCollector.get(self._kv_cfg)
+        self._kv_metrics.link_engine(self)
+
+        # Optional: cache meta to reuse at enqueue
+        try:
+            model_name = getattr(self, "model_config", None)
+            self._kv_model_name = getattr(model_name, "model", None) or getattr(model_name, "model_name", None)
+        except Exception:
+            self._kv_model_name = None
+
+        # dtype/meta discovery (best-effort, version-tolerant)
+        self._kv_dtype = None
+        try:
+            # try engine.layer_dtype or similar fields
+            self._kv_dtype = str(getattr(self, "dtype", None) or getattr(self, "layer_dtype", None) or "").lower() or None
+        except Exception:
+            pass
+
+        self._kv_num_devices = None
+        try:
+            import torch
+            self._kv_num_devices = torch.cuda.device_count()
+        except Exception:
+            pass
+
+        self._kv_block_size = None
+        try:
+            # common names across versions
+            for name in ["block_size", "kv_block_size", "cache_block_size"]:
+                val = getattr(self, name, None)
+                if val is not None:
+                    self._kv_block_size = int(val)
+                    break
+            # or find in a manager
+            if self._kv_block_size is None:
+                mgr = getattr(self, "block_manager", None) or getattr(self, "kv_cache_manager", None)
+                if mgr is not None:
+                    for name in ["block_size", "kv_block_size"]:
+                        val = getattr(mgr, name, None)
+                        if val is not None:
+                            self._kv_block_size = int(val)
+                            break
+        except Exception:
+            pass
+
 
         # Create sequence output processor, e.g. for beam search or
         # speculative decoding.
@@ -690,6 +742,40 @@ class LLMEngine:
             lora_request=lora_request,
         )
 
+                context_len = 0
+
+        # 1) try to get from the preprocessed inputs
+        pti = getattr(processed_inputs, "prompt_token_ids", None)
+        if pti is not None:
+            if isinstance(pti, (list, tuple)):
+                if len(pti) > 0 and isinstance(pti[0], (list, tuple)):
+                    context_len = len(pti[0])            # first sequence length
+                else:
+                    context_len = len(pti)               # single sequence length
+
+        # 2) fallback: try to get from the original prompt if it is a dict
+        if context_len == 0 and 'seq_len' in locals():
+            try:
+                context_len = int(seq_len)
+            except Exception:
+                context_len = 0
+
+        # 3) fallback: try to get from prompt_token_ids in the original prompt
+        if context_len == 0 and isinstance(prompt, dict):
+            pti2 = prompt.get("prompt_token_ids", None)
+            if isinstance(pti2, (list, tuple)):
+                context_len = len(pti2)
+
+        if self._kv_cfg.enabled:
+            self._kv_metrics.on_enqueue(
+                request_id,
+                context_len=context_len,
+                meta={"model": self._kv_model_name,
+                    "dtype": self._kv_dtype,
+                    "num_devices": self._kv_num_devices,
+                    "block_size": self._kv_block_size}
+            )
+
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,
@@ -928,6 +1014,13 @@ class LLMEngine:
 
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
+
+            if self._kv_cfg.enabled and getattr(seq_group, "_kv_first_marked", False) is False:
+                self._kv_metrics.on_first_token(seq_group.request_id)
+                self._kv_metrics.on_prefill_end(seq_group.request_id)
+                self._kv_metrics.snapshot_kv("prefill", seq_group.request_id)
+                setattr(seq_group, "_kv_first_marked", True)
+
             if not seq_group.is_prefill():
                 seq_group.set_last_token_time(now)
             request_output = RequestOutputFactory.create(
@@ -936,6 +1029,11 @@ class LLMEngine:
                 use_cache=self.use_cached_outputs)
             if request_output:
                 ctx.request_outputs.append(request_output)
+
+            if self._kv_cfg.enabled and getattr(seq_group, "_kv_end_magrked", False) is False:
+                self._kv_metrics.snapshot_kv("decode", seq_group.request_id)
+                self._kv_metrics.on_stream_end(seq_group.request_id)
+                setattr(seq_group, "_kv_end_marked", True)    
 
         # When we process a single request, we skip it for the next time,
         # and invoke the request output callback (if there was final output)
@@ -963,6 +1061,13 @@ class LLMEngine:
 
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
+
+            if self._kv_cfg.enabled and getattr(seq_group, "_kv_first_marked", False) is False:
+                self._kv_metrics.on_first_token(seq_group.request_id)
+                self._kv_metrics.on_prefill_end(seq_group.request_id)
+                self._kv_metrics.snapshot_kv("prefill", seq_group.request_id)
+                setattr(seq_group, "_kv_first_marked", True)
+
             if not seq_group.is_prefill():
                 seq_group.set_last_token_time(now)
             request_output = RequestOutputFactory.create(

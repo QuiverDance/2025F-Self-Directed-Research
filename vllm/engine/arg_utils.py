@@ -914,6 +914,22 @@ class EngineArgs:
                             action='store_true',
                             help='Disable logging statistics.')
 
+        group = parser.add_argument_group("KV Metrics (baseline)")
+        group.add_argument(
+            "--kv-metrics",
+            type=str,
+            default="off",
+            choices=["off", "baseline"],
+            help="Enable baseline request-scoped KV/latency metrics.",
+        )
+        group.add_argument(
+            "--kv-metrics-path",
+            type=str,
+            default=None,
+            help="Path to JSONL output file for KV baseline metrics. "
+                "Default: ./runs/kv_baseline.jsonl (or $VLLM_KV_METRICS_PATH).",
+        )
+
         return parser
 
     @classmethod

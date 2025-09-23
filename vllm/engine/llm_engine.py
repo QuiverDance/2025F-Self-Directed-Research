@@ -742,7 +742,7 @@ class LLMEngine:
             lora_request=lora_request,
         )
 
-                context_len = 0
+        context_len = 0
 
         # 1) try to get from the preprocessed inputs
         pti = getattr(processed_inputs, "prompt_token_ids", None)

@@ -301,6 +301,8 @@ class LLM:
         self.io_processor = get_io_processor(self.llm_engine.vllm_config,
                                              io_processor_plugin)
 
+        print(f"LLM initialized with model {engine_args.model} ")
+
     def get_tokenizer(
         self,
         lora_request: Optional[LoRARequest] = None,

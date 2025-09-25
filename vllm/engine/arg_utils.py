@@ -467,6 +467,10 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
+    # for instrumentation
+    kv_metrics: str = None
+    kv_metrics_path: str = None
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a

@@ -197,6 +197,8 @@ class LLM:
                                            CompilationConfig]] = None,
         logits_processors: Optional[list[Union[str,
                                                type[LogitsProcessor]]]] = None,
+        kv_metrics: str | None = None,
+        kv_metrics_path: str | None = None,
         **kwargs: Any,
     ) -> None:
         """LLM constructor."""
@@ -273,6 +275,8 @@ class LLM:
             override_pooler_config=override_pooler_config,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
+            kv_metrics=kv_metrics or "off",
+            kv_metrics_path=kv_metrics_path,
             **kwargs,
         )
 

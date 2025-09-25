@@ -1030,7 +1030,11 @@ class LLMEngine:
             if request_output:
                 ctx.request_outputs.append(request_output)
 
+            print("[DEBUG] kv config.enabled:", self._kv_cfg.enabled,
+                  ", request_id:", seq_group.request_id,
+                  ", _kv_first_marked:", getattr(seq_group, "_kv_first_marked", False))
             if self._kv_cfg.enabled and getattr(seq_group, "_kv_end_magrked", False) is False:
+                print("[DEBUG] marking end for request_id:", seq_group.request_id)
                 self._kv_metrics.snapshot_kv("decode", seq_group.request_id)
                 self._kv_metrics.on_stream_end(seq_group.request_id)
                 setattr(seq_group, "_kv_end_marked", True)    

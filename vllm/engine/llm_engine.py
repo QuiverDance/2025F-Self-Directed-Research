@@ -1033,7 +1033,7 @@ class LLMEngine:
             print("[DEBUG] kv config.enabled:", self._kv_cfg.enabled,
                   ", request_id:", seq_group.request_id,
                   ", _kv_first_marked:", getattr(seq_group, "_kv_first_marked", False))
-            if self._kv_cfg.enabled and getattr(seq_group, "_kv_end_magrked", False) is False:
+            if self._kv_cfg.enabled and getattr(seq_group, "_kv_end_marked", False) is False:
                 print("[DEBUG] marking end for request_id:", seq_group.request_id)
                 self._kv_metrics.snapshot_kv("decode", seq_group.request_id)
                 self._kv_metrics.on_stream_end(seq_group.request_id)
@@ -1200,6 +1200,9 @@ class LLMEngine:
                 break
         ```
         """
+
+        print("[DEBUG] LLMEngine.step() called")
+
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is only supported through AsyncLLMEngine "

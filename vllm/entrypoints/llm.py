@@ -1553,6 +1553,7 @@ class LLM:
         total_in_toks = 0
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
+            print("[DEBUG] stepping engine")
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
                 if output.finished:

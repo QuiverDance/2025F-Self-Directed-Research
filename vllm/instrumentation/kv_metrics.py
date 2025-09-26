@@ -188,6 +188,8 @@ class KVMetricsCollector:
         self._t_end: Dict[str, float] = {}
         self._finished: set[str] = set()  # guard double-flush
         self._lock = threading.Lock()
+        # Track inflight requests so we can write summary immediately when all finish.
+        self._inflight: set[str] = set()
 
         self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
         # register atexit once per process
@@ -264,6 +266,7 @@ class KVMetricsCollector:
                             base[k] = meta[k]
                 self._req[request_id] = RequestLog(**base)
             self._t_start[request_id] = now
+            self._inflight.add(request_id)
     
     def on_first_token(self, request_id: str) -> None:
         """Mark first token emission (TTFT & prefill_ms)."""
@@ -310,9 +313,17 @@ class KVMetricsCollector:
                 if self._agg is not None:
                     self._agg.observe_request(rec)
                 payload = asdict(rec)
-                payload["ts"] = int(time.time() * 1000)  # ordering aid
+                payload["ts"] = int(time.time() * 1000)  # ordering aid                
                 self._writer.write(payload)
+
             self._finished.add(request_id)
+            self._inflight.add(request_id)
+            # If no more inflight, write summary right now (no need to wait for atexit).
+            if self._agg is not None and self.cfg.summary_enabled and not self._inflight:
+                try:
+                    self._write_summary_at_exit()
+                except Exception:
+                    pass
             for d in (self._req, self._t_start, self._t_first, self._t_end):
                 d.pop(request_id, None)
 
@@ -350,6 +361,22 @@ class KVMetricsCollector:
         except Exception:
             # never raise on exit
             pass
+
+    def write_summary_now(self) -> Optional[str]:
+        """Manually write summary.json immediately. Returns path if written."""
+        if not self.cfg.summary_enabled or self._agg is None:
+            return None
+        try:
+            payload = self._agg.build_summary()
+            spath = self._summary_path()
+            d = os.path.dirname(spath)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(spath, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            return spath
+        except Exception:
+            return None
 
 class _RunAggregator:
     """Lightweight in-process aggregator for summary.json."""

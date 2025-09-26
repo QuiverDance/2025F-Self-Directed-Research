@@ -434,6 +434,12 @@ class LLMEngine:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
     def __del__(self):
+        # --- [KV] Force summary write on engine shutdown (safety net) -------
+        try:
+            self._kv_metrics.write_summary_now()
+        except Exception:
+            pass
+            
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 

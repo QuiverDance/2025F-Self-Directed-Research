@@ -172,10 +172,35 @@ class KVMetricsCollector:
 
     @classmethod
     def get(cls, config: Optional[KVMetricsConfig] = None) -> "KVMetricsCollector":
+        """Return singleton; if config differs, reconfigure the existing instance."""
         with cls._init_lock:
             if cls._instance is None:
                 cls._instance = KVMetricsCollector(config or KVMetricsConfig())
+            else:
+                if config is not None and cls._instance._config_differs_from(config):
+                    cls._instance._reconfigure(config)
         return cls._instance
+
+    def _config_differs_from(self, new_cfg: KVMetricsConfig) -> bool:
+        old = self.cfg
+        return (
+            bool(old.enabled) != bool(new_cfg.enabled) or
+            (getattr(old, "out_dir", None) != getattr(new_cfg, "out_dir", None)) or
+            (getattr(old, "out_file", None) != getattr(new_cfg, "out_file", None)) or
+            (getattr(old, "summary_enabled", None) != getattr(new_cfg, "summary_enabled", None)) or
+            (getattr(old, "summary_file", None) != getattr(new_cfg, "summary_file", None))
+        )
+
+    def _reconfigure(self, new_cfg: KVMetricsConfig) -> None:
+        """Rebuild writer/aggregator when env or args changed at runtime."""
+        self.cfg = new_cfg
+        self._writer = (_SafeJSONLWriter(self.cfg.out_dir, self.cfg.out_file)
+                        if self.cfg.enabled else None)
+        # rebuild aggregator + (idempotent) atexit
+        self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
+        if self._agg is not None and not getattr(self, "_atexit_registered", False):
+            atexit.register(self._write_summary_at_exit)
+            self._atexit_registered = True
 
     def __init__(self, config: KVMetricsConfig):
         self.cfg = config
@@ -193,8 +218,10 @@ class KVMetricsCollector:
 
         self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
         # register atexit once per process
-        if self._agg is not None:
+        self._atexit_registered = False
+        if self._agg is not None and not self._atexit_registered:
             atexit.register(self._write_summary_at_exit)
+            self._atexit_registered = True
 
     # ---------- Engine linking & KV snapshot ----------
     def link_engine(self, engine_like: Any) -> None:

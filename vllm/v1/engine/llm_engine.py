@@ -34,6 +34,12 @@ from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
+# --- KV instrumentation (request-scoped, unified) ---
+from vllm.instrumentation.kv_metrics import (
+    KVMetricsCollector,
+    KVMetricsConfig,
+)
+
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -120,6 +126,55 @@ class LLMEngine:
             # for v0 compatibility
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
 
+        # --- [KV] Wire up request-scoped metrics (env-driven enable) --------
+        # Uses env (VLLM_KV_METRICS / VLLM_KV_METRICS_PATH) for configuration.
+        self._kv_metrics = KVMetricsCollector.get(KVMetricsConfig())
+        self._kv_metrics.link_engine(self)
+
+        # Best-effort static meta recorded with each request log (repro hints).
+        self._kv_meta: dict[str, Any] = {
+            "model": getattr(self.model_config, "model", None)
+                     or getattr(self.model_config, "model_name", None),
+            "dtype": None,
+            "num_devices": None,
+            "block_size": None,
+        }
+        # dtype
+        try:
+            self._kv_meta["dtype"] = str(
+                getattr(self, "dtype", None) or getattr(self, "layer_dtype", None) or ""
+            ).lower() or None
+        except Exception:
+            pass
+        # num_devices
+        try:
+            import torch
+            self._kv_meta["num_devices"] = torch.cuda.device_count()
+        except Exception:
+            pass
+        # block_size (attribute names may differ by version)
+        try:
+            for name in ("block_size", "kv_block_size", "cache_block_size"):
+                val = getattr(self, name, None)
+                if val is not None:
+                    self._kv_meta["block_size"] = int(val)
+                    break
+            if self._kv_meta["block_size"] is None:
+                mgr = getattr(self, "block_manager", None) or getattr(self, "kv_cache_manager", None)
+                if mgr is not None:
+                    for name in ("block_size", "kv_block_size"):
+                        val = getattr(mgr, name, None)
+                        if val is not None:
+                            self._kv_meta["block_size"] = int(val)
+                            break
+        except Exception:
+            pass
+
+        # Per-request streaming state for first-token detection & counting.
+        self._kv_seen_first: set[str] = set()
+        self._kv_last_len: dict[str, int] = {}
+
+
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
@@ -193,6 +248,15 @@ class LLMEngine:
         request_ids = self.output_processor.abort_requests(request_ids)
         self.engine_core.abort_requests(request_ids)
 
+        # --- [KV] Mark 'decode' snapshot & flush for aborted requests -------
+        for rid in request_ids:
+            try:
+                self._kv_on_request_end(rid)
+                self._kv_last_len.pop(rid, None)
+                self._kv_seen_first.discard(rid)
+            except Exception:
+                pass
+
     def add_request(
         self,
         request_id: str,
@@ -214,11 +278,19 @@ class LLMEngine:
             request_id, prompt, params, arrival_time, lora_request,
             tokenization_kwargs, trace_headers, priority)
 
+        # --- [KV] Enqueue hook -----------------------
+        try:
+            context_len = self._kv_compute_context_len(prompt_str, request)
+            self._kv_on_enqueue(request_id, context_len)
+        except Exception:
+            pass
+
         n = params.n if isinstance(params, SamplingParams) else 1
 
         if n == 1:
             # Make a new RequestState and queue.
             self.output_processor.add_request(request, prompt_str, None, 0)
+
             # Add the request to EngineCore.
             self.engine_core.add_request(request)
             return
@@ -234,12 +306,13 @@ class LLMEngine:
             # Make a new RequestState and queue.
             self.output_processor.add_request(child_request, prompt_str,
                                               parent_req, idx)
+
             # Add the request to EngineCore.
             self.engine_core.add_request(child_request)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
         
-        print("[DEBUG] v1.engine.LLMEngine.step() called")
+        print("[DEBUG] LLMEngine.step() called")
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()
@@ -254,6 +327,12 @@ class LLMEngine:
             outputs.outputs,
             engine_core_timestamp=outputs.timestamp,
             iteration_stats=iteration_stats)
+
+        # --- [KV] Observe streaming to drive unified metrics ----------------
+        try:
+            self._kv_observe_processed_outputs(processed_outputs)
+        except Exception:
+            pass
 
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
@@ -331,3 +410,106 @@ class LLMEngine:
     def __del__(self):
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
+
+    # --- [KV] Helpers (small, isolated) ------------------------------------
+    def _kv_compute_context_len(self, prompt_str: Optional[str], request: Any) -> int:
+        """Compute prompt token length (BPE) best-effort."""
+        try:
+            ids = getattr(request, "prompt_token_ids", None)
+            if ids is not None:
+                return int(len(ids))
+        except Exception:
+            pass
+        try:
+            if isinstance(prompt_str, str) and self.tokenizer is not None:
+                enc = getattr(self.tokenizer, "encode", None)
+                if callable(enc):
+                    return int(len(enc(prompt_str)))
+        except Exception:
+            pass
+        return 0
+
+    def _kv_on_enqueue(self, request_id: str, context_len: int) -> None:
+        """Record enqueue with context length; no 'start' snapshot by design."""
+        cfg = getattr(self._kv_metrics, "cfg", None)
+        if not cfg or not cfg.enabled:
+            return
+        self._kv_metrics.on_enqueue(
+            request_id,
+            context_len=context_len,
+            meta=self._kv_meta,
+        )
+
+    def _kv_on_first_token(self, request_id: str) -> None:
+        """Mark first token (TTFT & prefill_ms) and take 'prefill' snapshot."""
+        cfg = getattr(self._kv_metrics, "cfg", None)
+        if not cfg or not cfg.enabled:
+            return
+        self._kv_metrics.on_first_token(request_id)
+        # In the unified baseline, prefill_end coincides with first token moment.
+        self._kv_metrics.on_prefill_end(request_id)
+        # Snapshot label: 'prefill' (no 'start' snapshot).
+        self._kv_metrics.snapshot_kv("prefill", request_id)
+
+    def _kv_on_request_end(self, request_id: str) -> None:
+        """Take 'decode' snapshot and flush the record."""
+        cfg = getattr(self._kv_metrics, "cfg", None)
+        if not cfg or not cfg.enabled:
+            return
+        self._kv_metrics.snapshot_kv("decode", request_id)
+        self._kv_metrics.on_stream_end(request_id)
+
+    def _kv_observe_processed_outputs(self, processed_outputs: Any) -> None:
+        """Observe streaming to (a) detect first token, (b) count tokens, and
+        (c) detect completion to flush metrics. Uses minimal assumptions about
+        RequestOutput structure for version tolerance."""
+        cfg = getattr(self._kv_metrics, "cfg", None)
+        if not cfg or not cfg.enabled:
+            return
+
+        req_outputs = getattr(processed_outputs, "request_outputs", []) or []
+        for ro in req_outputs:
+            rid = getattr(ro, "request_id", None) or getattr(ro, "id", None)
+            if not isinstance(rid, str):
+                continue
+
+            # Try to read current generated token ids length.
+            cur_len = None
+            out0 = None
+            outs = getattr(ro, "outputs", None)
+            if outs:
+                try:
+                    out0 = outs[0]
+                except Exception:
+                    out0 = None
+            if out0 is not None:
+                ids = getattr(out0, "token_ids", None)
+                if ids is not None:
+                    try:
+                        cur_len = int(len(ids))
+                    except Exception:
+                        cur_len = None
+
+            # First token detection + counting (EOS excluded by the collector).
+            if cur_len is not None:
+                last = self._kv_last_len.get(rid, 0)
+                delta = max(0, cur_len - last)
+                if rid not in self._kv_seen_first and delta > 0:
+                    self._kv_seen_first.add(rid)
+                    self._kv_on_first_token(rid)
+                if delta > 0:
+                    for _ in range(delta):
+                        self._kv_metrics.count_generated_token(rid, is_eos=False)
+                self._kv_last_len[rid] = cur_len
+
+            # Finish detection: explicit flag or finish_reason.
+            finished = bool(getattr(ro, "finished", False))
+            if not finished and out0 is not None:
+                fr = getattr(out0, "finish_reason", None)
+                if fr in ("eos_token", "stop", "length", "end_of_sequence"):
+                    finished = True
+
+            if finished:
+                self._kv_on_request_end(rid)
+                self._kv_last_len.pop(rid, None)
+                self._kv_seen_first.discard(rid)

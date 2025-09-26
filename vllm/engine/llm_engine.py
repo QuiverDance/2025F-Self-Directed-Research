@@ -57,7 +57,7 @@ from vllm.utils import Counter, Device, resolve_obj_by_qualname, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.worker.model_runner_base import InputProcessingError
 
-from vllm.instrumentation.kv_baseline import KVMetricsCollector, KVMetricsConfig
+from vllm.instrumentation.kv_metrics import KVMetricsCollector, KVMetricsConfig
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5

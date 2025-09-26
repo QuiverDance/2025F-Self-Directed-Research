@@ -59,9 +59,9 @@ class RequestLog:
 
 
 class _SafeJsonWriter:
-    """Thread-safe append-only JSONL writer."""
+    """Thread-safe append-only JSONL writer (dir + filename)."""
 
-    def __init__(self, path: str):
+    def __init__(self, log_dir: str, filename: str):
 
         self._dir = log_dir or "."
         os.makedirs(self._dir, exist_ok=True)
@@ -200,20 +200,19 @@ class KVMetricsCollector:
 
     def _kv_bytes_snapshot(self) -> Dict[str, int]:
         """Read global KV usage (bytes) from engine-like object."""
-        gpu_bytes = 0
-        cpu_bytes = 0
+
         eng = self._engine_ref
         if eng is None:
             return {"total": 0, "gpu": 0, "cpu": 0}
         
         mgr = _locate_kv_manager(eng)
-        gpu_bytes = _get_attr_any(mgr, ["gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"]) if mgr else None
-        cpu_bytes = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"]) if mgr else None
-
+        if mgr is not None:
+            gpu_b = _get_attr_any(mgr, ["gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"])
+            cpu_b = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"])
+        
         # If byte counters are available, use them directly.
-        if isinstance(gpu_bytes, int) or isinstance(cpu_bytes, int):
-            g = int(gpu_bytes or 0)
-            c = int(cpu_bytes or 0)
+        if isinstance(gpu_b, int) or isinstance(cpu_b, int):
+            g = int(gpu_b or 0); c = int(cpu_b or 0)
             return {"total": g + c, "gpu": g, "cpu": c}
 
         # Otherwise compute bytes = used_blocks * bytes_per_block
@@ -433,12 +432,40 @@ def _unwrap_engine_layers(eng: Any) -> list[Any]:
 
 def _locate_kv_manager(eng: Any) -> Any:
     """Try multiple paths to find a cache/block manager object."""
-    for layer in _unwrap_engine_layers(eng):
-        m = _get_attr_any(layer, [
-            "kv_cache_manager", "block_manager", "cache_manager", "block_space_manager"
-        ])
+    # Candidate attribute names to walk
+    NEXT = (
+        "engine_core", "engine", "core",
+        "model_executor", "scheduler", "cache_engine", "cache",
+        "kv_cache", "allocator", "pool",
+        "kv_cache_manager", "block_manager", "cache_manager", "block_space_manager",
+    )
+    # Direct hits first on each layer
+    DIRECT = (
+        "kv_cache_manager", "block_manager", "cache_manager", "block_space_manager",
+    )
+    
+    seen = set()
+    frontier = [eng]
+    steps = 0
+    while frontier and steps < 64:  # small cap to avoid runaway
+        cur = frontier.pop(0); steps += 1
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        # 1) Direct manager names
+        m = _get_attr_any(cur, list(DIRECT))
         if m is not None:
             return m
+        # 2) Also accept objects exposing used-block counters
+        if any(hasattr(cur, n) for n in (
+            "gpu_used_blocks","used_gpu_blocks","gpu_num_blocks",
+            "cpu_used_blocks","used_cpu_blocks","cpu_num_blocks")):
+            return cur
+        # 3) BFS to neighbors
+        for name in NEXT:
+            v = getattr(cur, name, None)
+            if v is not None and id(v) not in seen:
+                frontier.append(v)
     return None
 
 def _dtype_bytes(dtype_str: str | None) -> int:

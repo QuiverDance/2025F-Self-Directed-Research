@@ -129,7 +129,8 @@ class LLMEngine:
         # --- [KV] Wire up request-scoped metrics (env-driven enable) --------
         # Uses env (VLLM_KV_METRICS / VLLM_KV_METRICS_PATH) for configuration.
         self._kv_metrics = KVMetricsCollector.get(KVMetricsConfig())
-        self._kv_metrics.link_engine(self)
+        _core = getattr(self.engine_core, "engine_core", None)
+        self._kv_metrics.link_engine(_core or self)
 
         # Best-effort static meta recorded with each request log (repro hints).
         self._kv_meta: dict[str, Any] = {

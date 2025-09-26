@@ -92,9 +92,10 @@ class _SafeJsonWriter:
         return self._file
 
     def write(self, data: Dict[str, Any]):
+        """Append one JSON line to the log file."""
         line = json.dumps(data, ensure_ascii=False)
         with self._lock:
-            with open(self._path, "a", encoding="utf-8") as f:
+            with open(self._full_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
 class KVMetricsConfig:

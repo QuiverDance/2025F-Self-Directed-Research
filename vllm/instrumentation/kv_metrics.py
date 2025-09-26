@@ -63,21 +63,33 @@ class _SafeJsonWriter:
 
     def __init__(self, path: str):
 
-        # If a directory was given, write to kv_metrics.jsonl inside it.
-        if path.endswith(os.sep) or (os.path.isdir(path) and not os.path.isfile(path)):
-            path = os.path.join(path, "kv_metrics.jsonl")
-        # Add rank suffix automatically to avoid contention in multi-proc runs.
+        self._dir = log_dir or "."
+        os.makedirs(self._dir, exist_ok=True)
+
+        # Auto-append rank suffix to filename in multi-proc runs
+        base, ext = os.path.splitext(filename)
         rank = os.getenv("RANK") or os.getenv("LOCAL_RANK")
-        if rank is not None and path.endswith(".jsonl") and f".rank{rank}" not in path:
-            base, ext = os.path.splitext(path)
-            path = f"{base}.rank{rank}{ext}"
+        if rank is not None and ext == ".jsonl" and not base.endswith(f".rank{rank}"):
+            filename = f"{base}.rank{rank}{ext}"
 
-        self._path = path
+        self._file = filename
+        self._full_path = os.path.join(self._dir, self._file)
 
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        open(self._path, "a", encoding="utf-8").close()
-        
+        # Touch the file
+        open(self._full_path, "a", encoding="utf-8").close()
         self._lock = threading.Lock()
+    
+    @property
+    def full_path(self) -> str:
+        return self._full_path
+
+    @property
+    def directory(self) -> str:
+        return self._dir
+
+    @property
+    def filename(self) -> str:
+        return self._file
 
     def write(self, data: Dict[str, Any]):
         line = json.dumps(data, ensure_ascii=False)
@@ -88,19 +100,40 @@ class _SafeJsonWriter:
 class KVMetricsConfig:
     """Config driven by CLI/env.
     Enablement accepts: on/true/1/yes (case-insensitive)."""
-    def __init__(self, mode: Optional[str] = None, out_path:Optional[str]=None):
+    def __init__(self,
+                 mode: Optional[str] = None,
+                 out_dir: Optional[str] = None,
+                 out_file: Optional[str] = None,
+                 out_path: Optional[str] = None,
+                 summary_file: Optional[str] = None):
 
         env_mode = (os.getenv("VLLM_KV_METRICS") or "").strip().lower()
         mode = (mode or "").strip().lower() or env_mode
         truthy = {"on", "true", "1", "yes"}
         self._enabled = mode in truthy
 
+        # Backward-compat path (file path wins)
         env_path = os.getenv("VLLM_KV_METRICS_PATH")
-        self.out_path = out_path or env_path or "./runs/kv_metrics.jsonl"
+        path = out_path or env_path  # may be None
 
-        # Summary toggle (default: on)
+        # New-style dir/file
+        env_dir = os.getenv("VLLM_KV_METRICS_DIR")
+        env_file = os.getenv("VLLM_KV_METRICS_FILE")
+
+        if path:
+            # Split path into dir + file
+            d, f = os.path.split(path)
+            self.out_dir = d or "."
+            self.out_file = f or "kv_metrics.jsonl"
+        else:
+            self.out_dir = out_dir or env_dir or "./runs"
+            self.out_file = out_file or env_file or "kv_metrics.jsonl"
+
+        # Summary toggle (default: on) and filename
         self._summary_enabled = (os.getenv("VLLM_KV_METRICS_SUMMARY", "on")
                                  .strip().lower() in truthy)
+        env_sum_file = os.getenv("VLLM_KV_METRICS_SUMMARY_FILE")
+        self.summary_file = summary_file or env_sum_file or "summary.json"
 
 
     @property
@@ -145,7 +178,8 @@ class KVMetricsCollector:
 
     def __init__(self, config: KVMetricsConfig):
         self.cfg = config
-        self._writer = _SafeJsonWriter(self.cfg.out_path) if self.cfg.enabled else None
+        self._writer = (_SafeJsonWriter(self.cfg.out_dir, self.cfg.out_file)
+                        if self.cfg.enabled else None)
         self._engine_ref: Any = None
         self._req: Dict[str, RequestLog] = {}
         self._t_start: Dict[str, float] = {}
@@ -294,10 +328,12 @@ class KVMetricsCollector:
                 rec.generated_len += 1
 
     def _summary_path(self) -> str:
-        """Return path to summary.json next to the JSONL file."""
-        p = getattr(self._writer, "_path", None) if self._writer else self.cfg.out_path
-        base_dir = os.path.dirname(p) if p else "."
-        return os.path.join(base_dir, "summary.json")
+        """Return path to the summary file in the configured directory."""
+        if self._writer is not None:
+            base_dir = self._writer.directory
+        else:
+            base_dir = self.cfg.out_dir or "."
+        return os.path.join(base_dir, self.cfg.summary_file)
 
     def _write_summary_at_exit(self) -> None:
         if not self.cfg.summary_enabled or self._agg is None:

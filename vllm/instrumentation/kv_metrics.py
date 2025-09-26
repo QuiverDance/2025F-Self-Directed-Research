@@ -171,29 +171,28 @@ class KVMetricsCollector:
         eng = self._engine_ref
         if eng is None:
             return {"total": 0, "gpu": 0, "cpu": 0}
-        candidates = ["block_manager", "kv_cache_manager", "cache_manager", "block_space_manager"]
-        mgr = None
-        for name in candidates:
-            mgr = getattr(eng, name, None)
-            if mgr is not None:
-                break
-        def _try_int(x) -> int:
-            try:
-                return int(x)
-            except Exception:
-                return 0
-        if mgr is not None:
-            for attr in ("gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"):
-                val = getattr(mgr, attr, None)
-                if val is not None:
-                    gpu_bytes = _try_int(val)
-                    break
-            for attr in ("cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"):
-                val = getattr(mgr, attr, None)
-                if val is not None:
-                    cpu_bytes = _try_int(val)
-                    break
-        return {"total": gpu_bytes + cpu_bytes, "gpu": gpu_bytes, "cpu": cpu_bytes}
+        
+        mgr = _locate_kv_manager(eng)
+        gpu_bytes = _get_attr_any(mgr, ["gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"]) if mgr else None
+        cpu_bytes = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"]) if mgr else None
+
+        # If byte counters are available, use them directly.
+        if isinstance(gpu_bytes, int) or isinstance(cpu_bytes, int):
+            g = int(gpu_bytes or 0)
+            c = int(cpu_bytes or 0)
+            return {"total": g + c, "gpu": g, "cpu": c}
+
+        # Otherwise compute bytes = used_blocks * bytes_per_block
+        block_bytes = _infer_block_bytes(eng)
+        if block_bytes <= 0 or mgr is None:
+            return {"total": 0, "gpu": 0, "cpu": 0}
+
+        gpu_used = _get_used_blocks(mgr, "gpu")
+        cpu_used = _get_used_blocks(mgr, "cpu")
+
+        g = int(gpu_used) * block_bytes
+        c = int(cpu_used) * block_bytes
+        return {"total": g + c, "gpu": g, "cpu": c}
 
     def snapshot_kv(self, phase: str, request_id: str) -> None:
         """Store engine-global KV snapshot for the given phase ('prefill'|'decode')."""
@@ -364,3 +363,152 @@ class _RunAggregator:
             "ttft_ms_p90": ttft_p90,
             "peak_kv_bytes_total": self.peak_kv_total,
         }
+
+
+def _get_attr_any(obj: Any, names: list[str]):
+    """Return first existing attribute or callable() result among names."""
+    for n in names:
+        if not hasattr(obj, n):
+            continue
+        v = getattr(obj, n)
+        if callable(v):
+            try:
+                v = v()
+            except Exception:
+                continue
+        return v
+    return None
+
+def _unwrap_engine_layers(eng: Any) -> list[Any]:
+    """Yield plausible containers that might carry the KV manager."""
+    if eng is None:
+        return []
+    layers = [eng]
+    # common wrappers in v1
+    for n in ("engine_core", "engine", "core"):
+        x = getattr(eng, n, None)
+        if x is not None:
+            layers.append(x)
+            # one more hop (e.g., engine_core.engine_core)
+            y = getattr(x, n, None)
+            if y is not None:
+                layers.append(y)
+    return layers
+
+def _locate_kv_manager(eng: Any) -> Any:
+    """Try multiple paths to find a cache/block manager object."""
+    for layer in _unwrap_engine_layers(eng):
+        m = _get_attr_any(layer, [
+            "kv_cache_manager", "block_manager", "cache_manager", "block_space_manager"
+        ])
+        if m is not None:
+            return m
+    return None
+
+def _dtype_bytes(dtype_str: str | None) -> int:
+    if not dtype_str:
+        return 0
+    s = dtype_str.lower()
+    if s in ("fp16", "float16", "half"):
+        return 2
+    if s in ("bf16", "bfloat16"):
+        return 2
+    if s in ("fp32", "float32", "float"):
+        return 4
+    if s in ("fp8", "e4m3", "e5m2"):
+        return 1
+    return 0
+
+def _infer_block_bytes(eng: Any) -> int:
+    """Compute bytes per KV block from model/cache config."""
+    # block_size
+    bs = _get_attr_any(eng, ["cache_config", "vllm_config"])
+    block_size = None
+    if bs is not None and hasattr(bs, "block_size"):
+        block_size = getattr(bs, "block_size")
+    if block_size is None:
+        block_size = _get_attr_any(eng, ["block_size", "kv_block_size", "cache_block_size"])
+    try:
+        block_size = int(block_size) if block_size is not None else 16
+    except Exception:
+        block_size = 16
+
+    # model config / hf config (layers, heads, head_dim)
+    mc = _get_attr_any(eng, ["model_config"]) or _get_attr_any(eng, ["vllm_config"])
+    hf = None
+    for name in ("hf_config", "config"):
+        if mc is not None and hasattr(mc, name):
+            hf = getattr(mc, name)
+            break
+
+    num_layers = _get_attr_any(hf, ["num_hidden_layers", "n_layer"]) or \
+                 _get_attr_any(mc, ["num_hidden_layers"])
+    num_layers = int(num_layers) if num_layers is not None else 0
+
+    n_kv_heads = _get_attr_any(hf, ["num_key_value_heads", "n_kv_heads"]) or \
+                 _get_attr_any(mc, ["num_key_value_heads", "n_kv_heads"])
+    n_heads = _get_attr_any(hf, ["num_attention_heads", "n_head"]) or \
+              _get_attr_any(mc, ["num_attention_heads", "n_head"])
+    if n_kv_heads is None and n_heads is not None:
+        n_kv_heads = int(n_heads)  # fallback (no GQA info)
+    n_kv_heads = int(n_kv_heads) if n_kv_heads is not None else 0
+
+    head_dim = _get_attr_any(hf, ["head_dim"])
+    if head_dim is None:
+        hidden = _get_attr_any(hf, ["hidden_size", "n_embd"])
+        if hidden is not None and n_heads:
+            try:
+                head_dim = int(hidden) // int(n_heads)
+            except Exception:
+                head_dim = None
+    head_dim = int(head_dim) if head_dim is not None else 0
+
+    # KV dtype: prefer explicit kv_cache dtype; else engine/meta dtype
+    kv_dtype = None
+    cc = _get_attr_any(eng, ["cache_config"])
+    if cc is not None:
+        kv_dtype = _get_attr_any(cc, ["kv_cache_dtype"]) or _get_attr_any(cc, ["dtype"])
+    if kv_dtype is None:
+        kv_dtype = _get_attr_any(mc, ["dtype"])
+    byte_per = _dtype_bytes(str(kv_dtype) if kv_dtype else None)
+    if byte_per == 0:
+        # In practice KV cache is fp16/bf16 even for AWQ; default to 2B.
+        byte_per = 2
+
+    # 2 (K & V) * heads * head_dim * bytes * block_size * num_layers
+    try:
+        return int(2 * n_kv_heads * head_dim * byte_per * block_size * num_layers)
+    except Exception:
+        return 0
+
+def _get_used_blocks(mgr: Any, dev: str) -> int:
+    """Try to read used-block count for 'gpu' or 'cpu' from manager."""
+    # direct “used blocks”
+    v = _get_attr_any(mgr, [f"{dev}_used_blocks", f"used_{dev}_blocks",
+                            f"{dev}_active_blocks", f"active_{dev}_blocks"])
+    if isinstance(v, int):
+        return v
+    # total - free
+    total = _get_attr_any(mgr, [f"{dev}_num_blocks", f"num_{dev}_blocks",
+                                f"total_{dev}_blocks", f"{dev}_total_blocks"])
+    free = _get_attr_any(mgr, [f"{dev}_free_blocks", f"free_{dev}_blocks",
+                               f"num_free_{dev}_blocks"])
+    try:
+        if total is not None and free is not None:
+            return max(0, int(total) - int(free))
+    except Exception:
+        pass
+    # nested pool/stats guesses
+    pool = _get_attr_any(mgr, [f"{dev}_pool", f"{dev}_allocator", f"{dev}_cache"])
+    if pool is not None:
+        v2 = _get_attr_any(pool, ["used_blocks", "active_blocks", "num_used_blocks"])
+        if isinstance(v2, int):
+            return v2
+        tot = _get_attr_any(pool, ["total_blocks", "num_blocks"])
+        fre = _get_attr_any(pool, ["free_blocks", "num_free_blocks"])
+        try:
+            if tot is not None and fre is not None:
+                return max(0, int(tot) - int(fre))
+        except Exception:
+            pass
+    return 0

@@ -66,11 +66,15 @@ class _SafeJsonWriter:
         self._dir = log_dir or "."
         os.makedirs(self._dir, exist_ok=True)
 
-        # Auto-append rank suffix to filename in multi-proc runs
+        # Do NOT auto-append rank suffix by default.
+        # If you really want it, set VLLM_KV_METRICS_RANK_SUFFIX=on.
         base, ext = os.path.splitext(filename)
-        rank = os.getenv("RANK") or os.getenv("LOCAL_RANK")
-        if rank is not None and ext == ".jsonl" and not base.endswith(f".rank{rank}"):
-            filename = f"{base}.rank{rank}{ext}"
+        add_rank = (os.getenv("VLLM_KV_METRICS_RANK_SUFFIX", "off").strip().lower()
+                    in {"on", "true", "1", "yes"})
+        if add_rank and ext == ".jsonl":
+            rank = os.getenv("RANK") or os.getenv("LOCAL_RANK")
+            if rank and not base.endswith(f".rank{rank}"):
+                filename = f"{base}.rank{rank}{ext}"
 
         self._file = filename
         self._full_path = os.path.join(self._dir, self._file)
@@ -194,7 +198,7 @@ class KVMetricsCollector:
     def _reconfigure(self, new_cfg: KVMetricsConfig) -> None:
         """Rebuild writer/aggregator when env or args changed at runtime."""
         self.cfg = new_cfg
-        self._writer = (_SafeJSONLWriter(self.cfg.out_dir, self.cfg.out_file)
+        self._writer = (_SafeJsonWriter(self.cfg.out_dir, self.cfg.out_file)
                         if self.cfg.enabled else None)
         # rebuild aggregator + (idempotent) atexit
         self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
@@ -344,7 +348,7 @@ class KVMetricsCollector:
                 self._writer.write(payload)
 
             self._finished.add(request_id)
-            self._inflight.add(request_id)
+            self._inflight.discard(request_id)
             # If no more inflight, write summary right now (no need to wait for atexit).
             if self._agg is not None and self.cfg.summary_enabled and not self._inflight:
                 try:

@@ -135,7 +135,7 @@ class KVMetricsCollector:
 
     def __init__(self, config: KVMetricsConfig):
         self.cfg = config
-        self._writer = _SafeJSONLWriter(self.cfg.out_path) if self.cfg.enabled else None
+        self._writer = _SafeJsonWriter(self.cfg.out_path) if self.cfg.enabled else None
         self._engine_ref: Any = None
         self._req: Dict[str, RequestLog] = {}
         self._t_start: Dict[str, float] = {}

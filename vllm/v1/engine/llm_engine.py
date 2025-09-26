@@ -141,32 +141,59 @@ class LLMEngine:
         }
         # dtype
         try:
-            self._kv_meta["dtype"] = str(
-                getattr(self, "dtype", None) or getattr(self, "layer_dtype", None) or ""
-            ).lower() or None
+            dtype_from_model = getattr(self.model_config, "dtype", None) \
+                               or getattr(self.vllm_config.model_config, "dtype", None)
+            if dtype_from_model:
+                self._kv_meta["dtype"] = str(dtype_from_model).lower()
         except Exception:
             pass
+        if not self._kv_meta["dtype"]:
+            try:
+                self._kv_meta["dtype"] = str(
+                    getattr(self, "dtype", None) or getattr(self, "layer_dtype", None) or ""
+                ).lower() or None
+            except Exception:
+                pass
+
         # num_devices
         try:
             import torch
             self._kv_meta["num_devices"] = torch.cuda.device_count()
         except Exception:
             pass
-        # block_size (attribute names may differ by version)
+
+        # block_size
         try:
-            for name in ("block_size", "kv_block_size", "cache_block_size"):
-                val = getattr(self, name, None)
-                if val is not None:
-                    self._kv_meta["block_size"] = int(val)
-                    break
-            if self._kv_meta["block_size"] is None:
-                mgr = getattr(self, "block_manager", None) or getattr(self, "kv_cache_manager", None)
-                if mgr is not None:
-                    for name in ("block_size", "kv_block_size"):
-                        val = getattr(mgr, name, None)
-                        if val is not None:
-                            self._kv_meta["block_size"] = int(val)
-                            break
+            bs = getattr(self.cache_config, "block_size", None) \
+                 or getattr(self.vllm_config.cache_config, "block_size", None)
+            if bs is not None:
+                self._kv_meta["block_size"] = int(bs)
+        except Exception:
+            pass
+        if self._kv_meta["block_size"] is None:
+            try:
+                for name in ("block_size", "kv_block_size", "cache_block_size"):
+                    val = getattr(self, name, None)
+                    if val is not None:
+                        self._kv_meta["block_size"] = int(val)
+                        break
+                if self._kv_meta["block_size"] is None:
+                    mgr = getattr(self, "block_manager", None) or getattr(self, "kv_cache_manager", None)
+                    if mgr is not None:
+                        for name in ("block_size", "kv_block_size"):
+                            val = getattr(mgr, name, None)
+                            if val is not None:
+                                self._kv_meta["block_size"] = int(val)
+                                break
+            except Exception:
+                pass
+
+        # rank
+        try:
+            import os as _os
+            r = _os.getenv("RANK") or _os.getenv("LOCAL_RANK")
+            if r is not None:
+                self._kv_meta["rank"] = int(r)
         except Exception:
             pass
 
@@ -311,8 +338,6 @@ class LLMEngine:
             self.engine_core.add_request(child_request)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
-        
-        print("[DEBUG] LLMEngine.step() called")
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()

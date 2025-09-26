@@ -9,6 +9,8 @@ import json
 import os
 import threading
 import time
+import atexit
+from statistics import median
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
 
@@ -92,14 +94,22 @@ class KVMetricsConfig:
         mode = (mode or "").strip().lower() or env_mode
         truthy = {"on", "true", "1", "yes"}
         self._enabled = mode in truthy
+
         env_path = os.getenv("VLLM_KV_METRICS_PATH")
         self.out_path = out_path or env_path or "./runs/kv_metrics.jsonl"
+
+        # Summary toggle (default: on)
+        self._summary_enabled = (os.getenv("VLLM_KV_METRICS_SUMMARY", "on")
+                                 .strip().lower() in truthy)
 
 
     @property
     def enabled(self) -> bool:
         return bool(self._enabled)
 
+    @property
+    def summary_enabled(self) -> bool:
+        return bool(self._summary_enabled)
 
 class KVMetricsCollector:
     """
@@ -143,6 +153,11 @@ class KVMetricsCollector:
         self._t_end: Dict[str, float] = {}
         self._finished: set[str] = set()  # guard double-flush
         self._lock = threading.Lock()
+
+        self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
+        # register atexit once per process
+        if self._agg is not None:
+            atexit.register(self._write_summary_at_exit)
 
     # ---------- Engine linking & KV snapshot ----------
     def link_engine(self, engine_like: Any) -> None:
@@ -259,6 +274,8 @@ class KVMetricsCollector:
                 else:
                     rec.tps_decode = None
             if self._writer and rec:
+                if self._agg is not None:
+                    self._agg.observe_request(rec)
                 payload = asdict(rec)
                 payload["ts"] = int(time.time() * 1000)  # ordering aid
                 self._writer.write(payload)
@@ -276,3 +293,74 @@ class KVMetricsCollector:
             rec = self._req.get(request_id)
             if rec:
                 rec.generated_len += 1
+
+    def _summary_path(self) -> str:
+        """Return path to summary.json next to the JSONL file."""
+        p = getattr(self._writer, "_path", None) if self._writer else self.cfg.out_path
+        base_dir = os.path.dirname(p) if p else "."
+        return os.path.join(base_dir, "summary.json")
+
+    def _write_summary_at_exit(self) -> None:
+        if not self.cfg.summary_enabled or self._agg is None:
+            return
+        try:
+            payload = self._agg.build_summary()
+            spath = self._summary_path()
+            # ensure directory exists
+            d = os.path.dirname(spath)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(spath, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # never raise on exit
+            pass
+
+class _RunAggregator:
+    """Lightweight in-process aggregator for summary.json."""
+    def __init__(self):
+        self.total_context = 0
+        self.total_prefill_ms = 0.0
+        self.total_generated = 0
+        self.total_decode_ms = 0.0
+        self.ttft_list = []  # for p50/p90
+        self.peak_kv_total = 0
+        # optional counts
+        self._num_requests = 0
+
+    def observe_request(self, rec: "RequestLog"):
+        self._num_requests += 1
+        self.total_context += int(rec.context_len or 0)
+        self.total_generated += int(rec.generated_len or 0)
+        if rec.prefill_ms is not None:
+            self.total_prefill_ms += float(rec.prefill_ms)
+        if rec.decode_ms is not None:
+            self.total_decode_ms += float(rec.decode_ms)
+        if rec.ttft_ms is not None:
+            self.ttft_list.append(float(rec.ttft_ms))
+        # peak KV
+        for v in (rec.kv_bytes_total_at_prefill, rec.kv_bytes_total_at_decode):
+            if isinstance(v, int) and v > self.peak_kv_total:
+                self.peak_kv_total = v
+
+    def build_summary(self) -> dict:
+        # token-weighted TPS
+        tps_prefill = (self.total_context / (self.total_prefill_ms / 1000.0)
+                       if self.total_prefill_ms > 0 else None)
+        tps_decode = (self.total_generated / (self.total_decode_ms / 1000.0)
+                      if self.total_decode_ms > 0 else None)
+        ttft_p50 = median(self.ttft_list) if self.ttft_list else None
+        # p90 (simple, robust even for small N)
+        ttft_p90 = None
+        if self.ttft_list:
+            arr = sorted(self.ttft_list)
+            idx = max(0, int(round(0.90 * (len(arr) - 1))))
+            ttft_p90 = arr[idx]
+        return {
+            "num_requests": self._num_requests,
+            "tps_prefill_token_weighted": tps_prefill,
+            "tps_decode_token_weighted": tps_decode,
+            "ttft_ms_p50": ttft_p50,
+            "ttft_ms_p90": ttft_p90,
+            "peak_kv_bytes_total": self.peak_kv_total,
+        }

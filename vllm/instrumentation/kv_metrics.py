@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import atexit
+import math
 from statistics import median
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
@@ -439,9 +440,9 @@ class _RunAggregator:
     def build_summary(self) -> dict:
         # token-weighted TPS
         tps_prefill = (self.total_context / (self.total_prefill_ms / 1000.0)
-                       if self.total_prefill_ms > 0 else None)
+                       if self.total_context > 0 and self.total_prefill_ms >= 1.0 else None)
         tps_decode = (self.total_generated / (self.total_decode_ms / 1000.0)
-                      if self.total_decode_ms > 0 else None)
+                      if self.total_generated > 0 and self.total_decode_ms >= 1.0 else None)
         ttft_p50 = median(self.ttft_list) if self.ttft_list else None
         # p90 (simple, robust even for small N)
         ttft_p90 = None
@@ -491,40 +492,19 @@ def _unwrap_engine_layers(eng: Any) -> list[Any]:
 
 def _locate_kv_manager(eng: Any) -> Any:
     """Try multiple paths to find a cache/block manager object."""
-    # Candidate attribute names to walk
-    NEXT = (
-        "engine_core", "engine", "core",
-        "model_executor", "scheduler", "cache_engine", "cache",
-        "kv_cache", "allocator", "pool",
-        "kv_cache_manager", "block_manager", "cache_manager", "block_space_manager",
-    )
-    # Direct hits first on each layer
-    DIRECT = (
-        "kv_cache_manager", "block_manager", "cache_manager", "block_space_manager",
-    )
-    
-    seen = set()
-    frontier = [eng]
-    steps = 0
-    while frontier and steps < 64:  # small cap to avoid runaway
-        cur = frontier.pop(0); steps += 1
-        if id(cur) in seen:
-            continue
-        seen.add(id(cur))
-        # 1) Direct manager names
-        m = _get_attr_any(cur, list(DIRECT))
-        if m is not None:
-            return m
-        # 2) Also accept objects exposing used-block counters
-        if any(hasattr(cur, n) for n in (
-            "gpu_used_blocks","used_gpu_blocks","gpu_num_blocks",
-            "cpu_used_blocks","used_cpu_blocks","cpu_num_blocks")):
-            return cur
-        # 3) BFS to neighbors
-        for name in NEXT:
-            v = getattr(cur, name, None)
-            if v is not None and id(v) not in seen:
-                frontier.append(v)
+
+    try:
+        core = (getattr(eng, "engine_core", None)
+                or getattr(eng, "core", None)
+                or getattr(eng, "engine", None))
+        if core is not None:
+            sched = getattr(core, "scheduler", None)
+            if sched is not None:
+                m = getattr(sched, "kv_cache_manager", None)
+                if m is not None:
+                    return m
+    except Exception:
+        pass
     return None
 
 def _dtype_bytes(dtype_str: str | None) -> int:

@@ -329,6 +329,7 @@ class KVMetricsCollector:
         self.on_first_token(request_id)
 
     def on_stream_end(self, request_id: str) -> None:
+        print("KV metrics.on_stream_end start", request_id)
         """Finalize request record, compute decode_ms/TPS, flush JSONL once."""
         if not self.cfg.enabled:
             return
@@ -354,6 +355,7 @@ class KVMetricsCollector:
                     self._agg.observe_request(rec)
                 payload = asdict(rec)
                 payload["ts"] = int(time.time() * 1000)  # ordering aid                
+                print("KV metrics.on_stream_end writing", payload)
                 self._writer.write(payload)
 
             self._finished.add(request_id)
@@ -366,6 +368,7 @@ class KVMetricsCollector:
                     pass
             for d in (self._req, self._t_start, self._t_first, self._t_end):
                 d.pop(request_id, None)
+            print("KV metrics.on_stream_end done", request_id)
 
     def count_generated_token(self, request_id: str, is_eos: bool = False) -> None:
         """Increment generated_len for non-EOS tokens."""

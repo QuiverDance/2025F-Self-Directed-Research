@@ -487,11 +487,14 @@ class LLMEngine:
 
     def _kv_on_request_end(self, request_id: str) -> None:
         """Take 'decode' snapshot and flush the record."""
+        print("KV: request end start", request_id)
         cfg = getattr(self._kv_metrics, "cfg", None)
         if not cfg or not cfg.enabled:
             return
         self._kv_metrics.snapshot_kv("decode", request_id)
+        print("KV metrics.on_stream_end called", request_id)
         self._kv_metrics.on_stream_end(request_id)
+        print("KV: request end snapshot done", request_id)
 
     def _kv_observe_processed_outputs(self, processed_outputs: Any) -> None:
         """Observe streaming to (a) detect first token, (b) count tokens, and
@@ -543,6 +546,13 @@ class LLMEngine:
                 if fr in ("eos_token", "stop", "length", "end_of_sequence"):
                     finished = True
 
+            if not finished:
+            try:
+                if not self.has_unfinished_requests():
+                    finished = True
+            except Exception:
+                pass
+                
             if finished:
                 self._kv_on_request_end(rid)
                 self._kv_last_len.pop(rid, None)

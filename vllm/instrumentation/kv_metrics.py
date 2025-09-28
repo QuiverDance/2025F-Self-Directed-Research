@@ -97,11 +97,19 @@ class _SafeJsonWriter:
         return self._file
 
     def write(self, data: Dict[str, Any]):
-        """Append one JSON line to the log file."""
+        """Append one JSON line to the log file, and mirror to stdout."""
         line = json.dumps(data, ensure_ascii=False)
         with self._lock:
             with open(self._full_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+                f.flush()
+        # mirror to stdout (toggle with VLLM_KV_METRICS_STDOUT=on/off)
+        try:
+            if (os.getenv("VLLM_KV_METRICS_STDOUT", "on").lower()
+                    in {"on", "true", "1", "yes"}):
+                print(line)
+        except Exception:
+            pass
 
 class KVMetricsConfig:
     """Config driven by CLI/env.
@@ -390,6 +398,13 @@ class KVMetricsCollector:
                 os.makedirs(d, exist_ok=True)
             with open(spath, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+            # mirror to stdout
+            try:
+                if (os.getenv("VLLM_KV_METRICS_STDOUT", "on").lower()
+                        in {"on", "true", "1", "yes"}):
+                    print(json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                pass
         except Exception:
             # never raise on exit
             pass

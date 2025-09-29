@@ -414,22 +414,6 @@ class KVMetricsCollector:
             # never raise on exit
             pass
 
-    def write_summary_now(self) -> Optional[str]:
-        """Manually write summary.json immediately. Returns path if written."""
-        if not self.cfg.summary_enabled or self._agg is None:
-            return None
-        try:
-            payload = self._agg.build_summary()
-            spath = self._summary_path()
-            d = os.path.dirname(spath)
-            if d:
-                os.makedirs(d, exist_ok=True)
-            with open(spath, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            return spath
-        except Exception:
-            return None
-
 class _RunAggregator:
     """Lightweight in-process aggregator for summary.json."""
     def __init__(self):

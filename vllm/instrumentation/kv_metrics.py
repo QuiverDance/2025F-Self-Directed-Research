@@ -406,7 +406,6 @@ def _kv_bytes_snapshot(self) -> Dict[str, int]:
         try:
             payload = self._agg.build_summary()
             spath = self._summary_path()
-            # ensure directory exists
             d = os.path.dirname(spath)
             if d:
                 os.makedirs(d, exist_ok=True)
@@ -420,7 +419,6 @@ def _kv_bytes_snapshot(self) -> Dict[str, int]:
             except Exception:
                 pass
         except Exception:
-            # never raise on exit
             pass
 
 class _RunAggregator:
@@ -597,7 +595,7 @@ def _infer_block_bytes(eng: Any) -> int:
         # In practice KV cache is fp16/bf16 even for AWQ; default to 2B.
         byte_per = 2
 
-    # 2 (K & V) * heads * head_dim * bytes * block_size * num_layers
+    # KV bytes = 2 (K & V) * heads * head_dim * bytes * block_size * num_layers
     try:
         return int(2 * n_kv_heads * head_dim * byte_per * block_size * num_layers)
     except Exception:
@@ -608,7 +606,6 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
     Supports vLLM v1 BlockPool: GPU used = num_gpu_blocks - get_num_free_blocks().
     """
     dev = (device or "gpu").lower()
-    # Prefer BlockPool if present
     bp = getattr(mgr, "block_pool", None) or getattr(mgr, "pool", None) or mgr
 
     if dev == "gpu":
@@ -620,10 +617,8 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
                 return max(0, int(total) - free)
             except Exception:
                 return 0
-        # Fallbacks can be added here for other GPU pool shapes if needed.
 
     if dev == "cpu":
-        # Optional CPU pool support (often absent on single-GPU)
         total = getattr(bp, "num_cpu_blocks", None) or getattr(bp, "cpu_num_blocks", None)
         get_free = getattr(bp, "get_num_cpu_free_blocks", None)
         if isinstance(total, int) and callable(get_free):

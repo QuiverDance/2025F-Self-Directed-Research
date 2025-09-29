@@ -339,8 +339,6 @@ class LLMEngine:
             self.engine_core.add_request(child_request)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
-        print("LLMEngine.step() called")
-        
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()
@@ -440,7 +438,7 @@ class LLMEngine:
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
-    # --- [KV] Helpers (small, isolated) ------------------------------------
+    # --- [KV] Helpers ------------------------------------
     def _kv_compute_context_len(self, prompt_str: Optional[str], request: Any) -> int:
         """Compute prompt token length (BPE) best-effort."""
         try:
@@ -475,9 +473,7 @@ class LLMEngine:
         if not cfg or not cfg.enabled:
             return
         self._kv_metrics.on_first_token(request_id)
-        # In the unified baseline, prefill_end coincides with first token moment.
         self._kv_metrics.on_prefill_end(request_id)
-        # Snapshot label: 'prefill' (no 'start' snapshot).
         self._kv_metrics.snapshot_kv("prefill", request_id)
 
     def _kv_on_request_end(self, request_id: str) -> None:

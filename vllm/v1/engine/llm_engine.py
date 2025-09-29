@@ -493,11 +493,12 @@ class LLMEngine:
         if not cfg or not cfg.enabled:
             return
         self._kv_metrics.snapshot_kv("decode", request_id)
-        print("KV metrics.on_stream_end called", request_id)
+        print("[KVCHK-END] begin", request_id)
         self._kv_metrics.on_stream_end(request_id)
-        print("KV: request end snapshot done", request_id)
+        print("[KVCHK-END] done", request_id)
 
     def _kv_observe_processed_outputs(self, processed_outputs: Any) -> None:
+        print("[KVCHK-OBS] enter, n_ro=", len(getattr(processed_outputs, "request_outputs", []) or []))
         """Observe streaming to (a) detect first token, (b) count tokens, and
         (c) detect completion to flush metrics. Uses minimal assumptions about
         RequestOutput structure for version tolerance."""
@@ -553,6 +554,7 @@ class LLMEngine:
                         finished = True
                 except Exception:
                     pass
+            print("[KVCHK-OBS] rid=", rid, "finished=", finished,"fr=", getattr(out0, "finish_reason", None))
 
             if finished:
                 self._kv_on_request_end(rid)

@@ -329,7 +329,7 @@ class KVMetricsCollector:
         self.on_first_token(request_id)
 
     def on_stream_end(self, request_id: str) -> None:
-        print("KV metrics.on_stream_end start", request_id)
+        print("[KVCHK-WRITE] writer?", bool(self._writer), "summary?", self.cfg.summary_enabled)
         """Finalize request record, compute decode_ms/TPS, flush JSONL once."""
         if not self.cfg.enabled:
             return
@@ -368,7 +368,7 @@ class KVMetricsCollector:
                     pass
             for d in (self._req, self._t_start, self._t_first, self._t_end):
                 d.pop(request_id, None)
-            print("KV metrics.on_stream_end done", request_id)
+            print("[KVCHK-WRITE] wrote jsonl line for", request_id)
 
     def count_generated_token(self, request_id: str, is_eos: bool = False) -> None:
         """Increment generated_len for non-EOS tokens."""

@@ -241,36 +241,45 @@ class KVMetricsCollector:
         """Keep a weak-ish reference to engine internals for KV snapshots."""
         self._engine_ref = engine_like
 
-    def _kv_bytes_snapshot(self) -> Dict[str, int]:
-        """Read global KV usage (bytes) from engine-like object."""
+def _kv_bytes_snapshot(self) -> Dict[str, int]:
+    """Compute KV bytes from (a) direct counters or (b) used_blocks*block_bytes.
+    Always initialize locals to avoid UnboundLocalError.
+    """
+    eng = getattr(self, "_engine_ref", None)
+    if eng is None:
+        return {"total": 0, "gpu": 0, "cpu": 0}
 
-        eng = self._engine_ref
-        if eng is None:
-            return {"total": 0, "gpu": 0, "cpu": 0}
-        
-        mgr = _locate_kv_manager(eng)
-        gpu_b = None
-        cpu_b = None
-        if mgr is not None:
-            gpu_b = _get_attr_any(mgr, ["gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"])
-            cpu_b = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"])
-        
-            # If byte counters are available, use them directly.
-            if isinstance(gpu_b, int) or isinstance(cpu_b, int):
-                g = int(gpu_b or 0); c = int(cpu_b or 0)
-                return {"total": g + c, "gpu": g, "cpu": c}
+    mgr = _locate_kv_manager(eng)
 
-        # Otherwise compute bytes = used_blocks * bytes_per_block
-        block_bytes = _infer_block_bytes(eng)
-        if block_bytes <= 0 or mgr is None:
-            return {"total": 0, "gpu": 0, "cpu": 0}
-
-        gpu_used = _get_used_blocks(mgr, "gpu")
-        cpu_used = _get_used_blocks(mgr, "cpu")
-
-        g = int(gpu_used) * block_bytes
-        c = int(cpu_used) * block_bytes
+    # 1) Direct byte counters (best possible, if exposed by the manager)
+    gpu_b = None
+    cpu_b = None
+    if mgr is not None:
+        for name in ("gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"):
+            v = getattr(mgr, name, None)
+            if isinstance(v, int):
+                gpu_b = int(v)
+                break
+        for name in ("cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"):
+            v = getattr(mgr, name, None)
+            if isinstance(v, int):
+                cpu_b = int(v)
+                break
+    if isinstance(gpu_b, int) or isinstance(cpu_b, int):
+        g = int(gpu_b or 0)
+        c = int(cpu_b or 0)
         return {"total": g + c, "gpu": g, "cpu": c}
+
+    # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
+    block_bytes = _infer_block_bytes(eng)
+    if block_bytes <= 0 or mgr is None:
+        return {"total": 0, "gpu": 0, "cpu": 0}
+
+    g_blocks = _get_used_blocks(mgr, "gpu")
+    c_blocks = _get_used_blocks(mgr, "cpu")
+    g = int(g_blocks) * int(block_bytes)
+    c = int(c_blocks) * int(block_bytes)
+    return {"total": g + c, "gpu": g, "cpu": c}
 
     def snapshot_kv(self, phase: str, request_id: str) -> None:
         """Store engine-global KV snapshot for the given phase ('prefill'|'decode')."""
@@ -496,19 +505,26 @@ def _unwrap_engine_layers(eng: Any) -> list[Any]:
 
 def _locate_kv_manager(eng: Any) -> Any:
     """Try multiple paths to find a cache/block manager object."""
-
-    try:
-        core = (getattr(eng, "engine_core", None)
-                or getattr(eng, "core", None)
-                or getattr(eng, "engine", None))
-        if core is not None:
-            sched = getattr(core, "scheduler", None)
-            if sched is not None:
-                m = getattr(sched, "kv_cache_manager", None)
+    layers = [
+        eng,
+        getattr(eng, "engine_core", None),
+        getattr(eng, "core", None),
+        getattr(eng, "engine", None),
+    ]
+    layers = [x for x in layers if x is not None]
+    for layer in layers:
+        # Try under scheduler first
+        sched = getattr(layer, "scheduler", None)
+        if sched is not None:
+            for name in ("kv_cache_manager", "block_manager", "cache_manager"):
+                m = getattr(sched, name, None)
                 if m is not None:
                     return m
-    except Exception:
-        pass
+        # Then try layer itself
+        for name in ("kv_cache_manager", "block_manager", "cache_manager"):
+            m = getattr(layer, name, None)
+            if m is not None:
+                return m
     return None
 
 def _dtype_bytes(dtype_str: str | None) -> int:
@@ -587,34 +603,35 @@ def _infer_block_bytes(eng: Any) -> int:
     except Exception:
         return 0
 
-def _get_used_blocks(mgr: Any, dev: str) -> int:
-    """Try to read used-block count for 'gpu' or 'cpu' from manager."""
-    # direct “used blocks”
-    v = _get_attr_any(mgr, [f"{dev}_used_blocks", f"used_{dev}_blocks",
-                            f"{dev}_active_blocks", f"active_{dev}_blocks"])
-    if isinstance(v, int):
-        return v
-    # total - free
-    total = _get_attr_any(mgr, [f"{dev}_num_blocks", f"num_{dev}_blocks",
-                                f"total_{dev}_blocks", f"{dev}_total_blocks"])
-    free = _get_attr_any(mgr, [f"{dev}_free_blocks", f"free_{dev}_blocks",
-                               f"num_free_{dev}_blocks"])
-    try:
-        if total is not None and free is not None:
-            return max(0, int(total) - int(free))
-    except Exception:
-        pass
-    # nested pool/stats guesses
-    pool = _get_attr_any(mgr, [f"{dev}_pool", f"{dev}_allocator", f"{dev}_cache"])
-    if pool is not None:
-        v2 = _get_attr_any(pool, ["used_blocks", "active_blocks", "num_used_blocks"])
-        if isinstance(v2, int):
-            return v2
-        tot = _get_attr_any(pool, ["total_blocks", "num_blocks"])
-        fre = _get_attr_any(pool, ["free_blocks", "num_free_blocks"])
-        try:
-            if tot is not None and fre is not None:
-                return max(0, int(tot) - int(fre))
-        except Exception:
-            pass
+def _get_used_blocks(mgr: Any, device: str) -> int:
+    """Return number of used KV blocks for the given device.
+    Supports vLLM v1 BlockPool: GPU used = num_gpu_blocks - get_num_free_blocks().
+    """
+    dev = (device or "gpu").lower()
+    # Prefer BlockPool if present
+    bp = getattr(mgr, "block_pool", None) or getattr(mgr, "pool", None) or mgr
+
+    if dev == "gpu":
+        total = getattr(bp, "num_gpu_blocks", None)
+        get_free = getattr(bp, "get_num_free_blocks", None)
+        if isinstance(total, int) and callable(get_free):
+            try:
+                free = int(get_free())
+                return max(0, int(total) - free)
+            except Exception:
+                return 0
+        # Fallbacks can be added here for other GPU pool shapes if needed.
+
+    if dev == "cpu":
+        # Optional CPU pool support (often absent on single-GPU)
+        total = getattr(bp, "num_cpu_blocks", None) or getattr(bp, "cpu_num_blocks", None)
+        get_free = getattr(bp, "get_num_cpu_free_blocks", None)
+        if isinstance(total, int) and callable(get_free):
+            try:
+                free = int(get_free())
+                return max(0, int(total) - free)
+            except Exception:
+                return 0
+        return 0
+
     return 0

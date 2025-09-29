@@ -249,14 +249,16 @@ class KVMetricsCollector:
             return {"total": 0, "gpu": 0, "cpu": 0}
         
         mgr = _locate_kv_manager(eng)
+        gpu_b = None
+        cpu_b = None
         if mgr is not None:
             gpu_b = _get_attr_any(mgr, ["gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"])
             cpu_b = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"])
         
-        # If byte counters are available, use them directly.
-        if isinstance(gpu_b, int) or isinstance(cpu_b, int):
-            g = int(gpu_b or 0); c = int(cpu_b or 0)
-            return {"total": g + c, "gpu": g, "cpu": c}
+            # If byte counters are available, use them directly.
+            if isinstance(gpu_b, int) or isinstance(cpu_b, int):
+                g = int(gpu_b or 0); c = int(cpu_b or 0)
+                return {"total": g + c, "gpu": g, "cpu": c}
 
         # Otherwise compute bytes = used_blocks * bytes_per_block
         block_bytes = _infer_block_bytes(eng)

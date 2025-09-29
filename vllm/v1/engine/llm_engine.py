@@ -359,7 +359,8 @@ class LLMEngine:
         # --- [KV] Observe streaming to drive unified metrics ----------------
         try:
             self._kv_observe_processed_outputs(processed_outputs)
-        except Exception:
+        except Exception e:
+            logger.warning(f"KV metrics observe error: {e}")
             pass
 
         # 3) Abort any reqs that finished due to stop strings.
@@ -547,12 +548,12 @@ class LLMEngine:
                     finished = True
 
             if not finished:
-            try:
-                if not self.has_unfinished_requests():
-                    finished = True
-            except Exception:
-                pass
-                
+                try:
+                    if not self.has_unfinished_requests():
+                        finished = True
+                except Exception:
+                    pass
+
             if finished:
                 self._kv_on_request_end(rid)
                 self._kv_last_len.pop(rid, None)

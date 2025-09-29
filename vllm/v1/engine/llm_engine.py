@@ -359,7 +359,7 @@ class LLMEngine:
         # --- [KV] Observe streaming to drive unified metrics ----------------
         try:
             self._kv_observe_processed_outputs(processed_outputs)
-        except Exception e:
+        except Exception as e:
             logger.warning(f"KV metrics observe error: {e}")
             pass
 

@@ -241,45 +241,45 @@ class KVMetricsCollector:
         """Keep a weak-ish reference to engine internals for KV snapshots."""
         self._engine_ref = engine_like
 
-def _kv_bytes_snapshot(self) -> Dict[str, int]:
-    """Compute KV bytes from (a) direct counters or (b) used_blocks*block_bytes.
-    Always initialize locals to avoid UnboundLocalError.
-    """
-    eng = getattr(self, "_engine_ref", None)
-    if eng is None:
-        return {"total": 0, "gpu": 0, "cpu": 0}
+    def _kv_bytes_snapshot(self) -> Dict[str, int]:
+        """Compute KV bytes from (a) direct counters or (b) used_blocks*block_bytes.
+        Always initialize locals to avoid UnboundLocalError.
+        """
+        eng = getattr(self, "_engine_ref", None)
+        if eng is None:
+            return {"total": 0, "gpu": 0, "cpu": 0}
 
-    mgr = _locate_kv_manager(eng)
+        mgr = _locate_kv_manager(eng)
 
-    # 1) Direct byte counters (best possible, if exposed by the manager)
-    gpu_b = None
-    cpu_b = None
-    if mgr is not None:
-        for name in ("gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"):
-            v = getattr(mgr, name, None)
-            if isinstance(v, int):
-                gpu_b = int(v)
-                break
-        for name in ("cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"):
-            v = getattr(mgr, name, None)
-            if isinstance(v, int):
-                cpu_b = int(v)
-                break
-    if isinstance(gpu_b, int) or isinstance(cpu_b, int):
-        g = int(gpu_b or 0)
-        c = int(cpu_b or 0)
+        # 1) Direct byte counters (best possible, if exposed by the manager)
+        gpu_b = None
+        cpu_b = None
+        if mgr is not None:
+            for name in ("gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"):
+                v = getattr(mgr, name, None)
+                if isinstance(v, int):
+                    gpu_b = int(v)
+                    break
+            for name in ("cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"):
+                v = getattr(mgr, name, None)
+                if isinstance(v, int):
+                    cpu_b = int(v)
+                    break
+        if isinstance(gpu_b, int) or isinstance(cpu_b, int):
+            g = int(gpu_b or 0)
+            c = int(cpu_b or 0)
+            return {"total": g + c, "gpu": g, "cpu": c}
+
+        # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
+        block_bytes = _infer_block_bytes(eng)
+        if block_bytes <= 0 or mgr is None:
+            return {"total": 0, "gpu": 0, "cpu": 0}
+
+        g_blocks = _get_used_blocks(mgr, "gpu")
+        c_blocks = _get_used_blocks(mgr, "cpu")
+        g = int(g_blocks) * int(block_bytes)
+        c = int(c_blocks) * int(block_bytes)
         return {"total": g + c, "gpu": g, "cpu": c}
-
-    # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
-    block_bytes = _infer_block_bytes(eng)
-    if block_bytes <= 0 or mgr is None:
-        return {"total": 0, "gpu": 0, "cpu": 0}
-
-    g_blocks = _get_used_blocks(mgr, "gpu")
-    c_blocks = _get_used_blocks(mgr, "cpu")
-    g = int(g_blocks) * int(block_bytes)
-    c = int(c_blocks) * int(block_bytes)
-    return {"total": g + c, "gpu": g, "cpu": c}
 
     def snapshot_kv(self, phase: str, request_id: str) -> None:
         """Store engine-global KV snapshot for the given phase ('prefill'|'decode')."""

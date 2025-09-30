@@ -652,7 +652,7 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
     # for debugging
     _kvdbg(f"used_blocks[{d}]", "no block_pool")
 
-    if dev == "gpu" and bp is not None::
+    if dev == "gpu" and bp is not None:
         total = getattr(bp, "num_gpu_blocks", None)
         get_free = getattr(bp, "get_num_free_blocks", None)
         if isinstance(total, int) and callable(get_free):
@@ -665,7 +665,7 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
                 _kvdbg("used_blocks[gpu].err", str(e))
                 return 0
 
-    if dev == "cpu" and bp is not None::
+    if dev == "cpu" and bp is not None:
         total = getattr(bp, "num_cpu_blocks", None) or getattr(bp, "cpu_num_blocks", None)
         get_free = getattr(bp, "get_num_cpu_free_blocks", None)
         if isinstance(total, int) and callable(get_free):

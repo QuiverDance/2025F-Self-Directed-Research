@@ -127,10 +127,20 @@ class LLMEngine:
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
 
         # --- [KV] Wire up request-scoped metrics (env-driven enable) --------
-        # Uses env (VLLM_KV_METRICS / VLLM_KV_METRICS_PATH) for configuration.
-        self._kv_metrics = KVMetricsCollector.get(KVMetricsConfig())
-        _core = getattr(self.engine_core, "engine_core", None)
-        self._kv_metrics.link_engine(_core or self)
+        # === attach KV metrics collector to the actual engine core ===
+        try:
+            col = KVMetricsCollector.get()   # env-based config
+            eng_like = self.engine_core
+            # In single-process, EngineCoreClient exposes the real EngineCore here:
+            if hasattr(eng_like, "engine_core"):
+                eng_like = eng_like.engine_core
+            col.link_engine(eng_like or self)
+            self._kv_metrics = col
+            if os.getenv("VLLM_KV_DEBUG", "").lower() in ("1","true","on","yes"):
+                print("[KVDBG] linked metrics to", type(eng_like).__name__, flush=True)
+        except Exception as e:
+            if os.getenv("VLLM_KV_DEBUG", "").lower() in ("1","true","on","yes"):
+                print("[KVDBG] link_engine failed:", repr(e), flush=True)
 
         # Best-effort static meta recorded with each request log (repro hints).
         self._kv_meta: dict[str, Any] = {

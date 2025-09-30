@@ -277,7 +277,8 @@ class KVMetricsCollector:
         c = int(c_blocks) * int(block_bytes)
 
         _kvdbg("snapshot.blocks", {"g_blocks": g_blocks, "c_blocks": c_blocks})
-        _kvdbg("snapshot.bytes", out)
+        totals = {"total": g + c, "gpu": g, "cpu": c}
+        _kvdbg("snapshot.bytes", totals)
 
         return {"total": g + c, "gpu": g, "cpu": c}
 
@@ -554,10 +555,25 @@ def _get_core_scheduler_manager(eng):
     """Return (core, scheduler, kv_cache_manager) using vLLM v1 fixed path."""
     # Normalize engine core (v1 stacks can be eng.engine_core.engine_core)
     core = getattr(eng, "engine_core", None)
-    if core is not None and hasattr(core, "engine_core"):
-        core = core.engine_core
-    sched = getattr(core, "scheduler", None) if core is not None else None
-    mgr = getattr(sched, "kv_cache_manager", None) if sched is not None else None
+    # unwrap multiple layers
+    while core is not None and hasattr(core, "engine_core"):
+        core = getattr(core, "engine_core")
+
+    sched = getattr(core, "scheduler", None)
+    if sched is None and hasattr(core, "model_executor"):
+        sched = getattr(core.model_executor, "scheduler", None)
+    
+    mgr = None
+    if sched is not None:
+        for name in ("kv_cache_manager", "block_manager", "cache_manager"):
+            mgr = getattr(sched, name, None)
+            if mgr is not None:
+                break
+    if mgr is None and core is not None:
+        for name in ("kv_cache_manager", "block_manager", "cache_manager"):
+            mgr = getattr(core, name, None)
+            if mgr is not None:
+                break
 
     # for debugging
     _kvdbg("resolve.core", type(core).__name__ if core else None)
@@ -650,7 +666,8 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
     bp = getattr(mgr, "block_pool", None) or getattr(mgr, "pool", None)
 
     # for debugging
-    _kvdbg(f"used_blocks[{d}]", "no block_pool")
+    if bp is None:
+        _kvdbg(f"used_blocks[{dev}]", "no block_pool")
 
     if dev == "gpu" and bp is not None:
         total = getattr(bp, "num_gpu_blocks", None)
@@ -676,7 +693,7 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
                 return 0
         return 0
 
-    _kvdbg(f"used_blocks[{d}]", "unsupported device")
+    _kvdbg(f"used_blocks[{dev}]", "unsupported device")
     return 0
 
 def _kvdbg(tag: str, payload=None):

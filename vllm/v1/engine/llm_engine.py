@@ -136,11 +136,9 @@ class LLMEngine:
                 eng_like = eng_like.engine_core
             col.link_engine(eng_like or self)
             self._kv_metrics = col
-            if os.getenv("VLLM_KV_DEBUG", "").lower() in ("1","true","on","yes"):
-                print("[KVDBG] linked metrics to", type(eng_like).__name__, flush=True)
+            print("[KVDBG] linked metrics to", type(eng_like).__name__, flush=True)
         except Exception as e:
-            if os.getenv("VLLM_KV_DEBUG", "").lower() in ("1","true","on","yes"):
-                print("[KVDBG] link_engine failed:", repr(e), flush=True)
+            print("[KVDBG] link_engine failed:", repr(e), flush=True)
 
         # Best-effort static meta recorded with each request log (repro hints).
         self._kv_meta: dict[str, Any] = {

@@ -249,25 +249,16 @@ class KVMetricsCollector:
         if eng is None:
             return {"total": 0, "gpu": 0, "cpu": 0}
 
-        mgr = _locate_kv_manager(eng)
+        # mgr = _locate_kv_manager(eng)
+        _, _, mgr = _get_core_scheduler_manager(eng)
+        if mgr is None:
+            return {"total": 0, "gpu": 0, "cpu": 0}
 
         # 1) Direct byte counters (best possible, if exposed by the manager)
-        gpu_b = None
-        cpu_b = None
-        if mgr is not None:
-            for name in ("gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"):
-                v = getattr(mgr, name, None)
-                if isinstance(v, int):
-                    gpu_b = int(v)
-                    break
-            for name in ("cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"):
-                v = getattr(mgr, name, None)
-                if isinstance(v, int):
-                    cpu_b = int(v)
-                    break
+        gpu_b = _get_attr_any(mgr, ["gpu_bytes", "gpu_used_bytes", "gpu_allocated_bytes"]) if mgr else None
+        cpu_b = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"]) if mgr else None
         if isinstance(gpu_b, int) or isinstance(cpu_b, int):
-            g = int(gpu_b or 0)
-            c = int(cpu_b or 0)
+            g = int(gpu_b or 0); c = int(cpu_b or 0)
             return {"total": g + c, "gpu": g, "cpu": c}
 
         # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
@@ -285,19 +276,38 @@ class KVMetricsCollector:
         """Store engine-global KV snapshot for the given phase ('prefill'|'decode')."""
         if not self.cfg.enabled:
             return
+
         snap = self._kv_bytes_snapshot()
+        total = int(snap.get("total", 0))
+        gpu   = int(snap.get("gpu", 0))
+        cpu   = int(snap.get("cpu", 0))
+
+        key_total = f"kv_bytes_total_at_{phase}"
+        key_gpu   = f"kv_bytes_gpu_at_{phase}"
+        key_cpu   = f"kv_bytes_cpu_at_{phase}"
+
         with self._lock:
             rec = self._req.get(request_id)
             if not rec:
                 return
-            if phase == "prefill":
-                rec.kv_bytes_total_at_prefill = snap["total"]
-                rec.kv_bytes_gpu_at_prefill = snap["gpu"]
-                rec.kv_bytes_cpu_at_prefill = snap["cpu"]
-            elif phase == "decode":
-                rec.kv_bytes_total_at_decode = snap["total"]
-                rec.kv_bytes_gpu_at_decode = snap["gpu"]
-                rec.kv_bytes_cpu_at_decode = snap["cpu"]
+
+            # Write into the record (dict-first; fallback to attribute if not a dict)
+            if isinstance(rec, dict):
+                rec[key_total] = total
+                rec[key_gpu]   = gpu
+                rec[key_cpu]   = cpu
+            else:
+                setattr(rec, key_total, total)
+                setattr(rec, key_gpu,   gpu)
+                setattr(rec, key_cpu,   cpu)
+
+            # Maintain peak for summary
+            try:
+                prev_peak = int(self._agg.get("peak_kv_bytes_total", 0))
+                if total > prev_peak:
+                    self._agg["peak_kv_bytes_total"] = total
+            except Exception:
+                pass
 
     
     def on_enqueue(self, request_id: str, context_len: int, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -525,6 +535,16 @@ def _locate_kv_manager(eng: Any) -> Any:
                 return m
     return None
 
+def _get_core_scheduler_manager(eng):
+    """Return (core, scheduler, kv_cache_manager) using vLLM v1 fixed path."""
+    # Normalize engine core (v1 stacks can be eng.engine_core.engine_core)
+    core = getattr(eng, "engine_core", None)
+    if core is not None and hasattr(core, "engine_core"):
+        core = core.engine_core
+    sched = getattr(core, "scheduler", None) if core is not None else None
+    mgr = getattr(sched, "kv_cache_manager", None) if sched is not None else None
+    return core, sched, mgr
+
 def _dtype_bytes(dtype_str: str | None) -> int:
     if not dtype_str:
         return 0
@@ -606,9 +626,9 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
     Supports vLLM v1 BlockPool: GPU used = num_gpu_blocks - get_num_free_blocks().
     """
     dev = (device or "gpu").lower()
-    bp = getattr(mgr, "block_pool", None) or getattr(mgr, "pool", None) or mgr
+    bp = getattr(mgr, "block_pool", None) or getattr(mgr, "pool", None)
 
-    if dev == "gpu":
+    if dev == "gpu" and bp is not None::
         total = getattr(bp, "num_gpu_blocks", None)
         get_free = getattr(bp, "get_num_free_blocks", None)
         if isinstance(total, int) and callable(get_free):
@@ -618,7 +638,7 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
             except Exception:
                 return 0
 
-    if dev == "cpu":
+    if dev == "cpu" and bp is not None::
         total = getattr(bp, "num_cpu_blocks", None) or getattr(bp, "cpu_num_blocks", None)
         get_free = getattr(bp, "get_num_cpu_free_blocks", None)
         if isinstance(total, int) and callable(get_free):

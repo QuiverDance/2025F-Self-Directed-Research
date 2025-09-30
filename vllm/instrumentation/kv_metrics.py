@@ -247,11 +247,13 @@ class KVMetricsCollector:
         """
         eng = getattr(self, "_engine_ref", None)
         if eng is None:
+            _kvdbg("snapshot", "no engine_ref")
             return {"total": 0, "gpu": 0, "cpu": 0}
 
         # mgr = _locate_kv_manager(eng)
         _, _, mgr = _get_core_scheduler_manager(eng)
         if mgr is None:
+            _kvdbg("snapshot", "no manager")
             return {"total": 0, "gpu": 0, "cpu": 0}
 
         # 1) Direct byte counters (best possible, if exposed by the manager)
@@ -259,10 +261,13 @@ class KVMetricsCollector:
         cpu_b = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"]) if mgr else None
         if isinstance(gpu_b, int) or isinstance(cpu_b, int):
             g = int(gpu_b or 0); c = int(cpu_b or 0)
+            out = {"total": g + c, "gpu": g, "cpu": c}
+            _kvdbg("snapshot.direct", out)
             return {"total": g + c, "gpu": g, "cpu": c}
 
         # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
         block_bytes = _infer_block_bytes(eng)
+        _kvdbg("snapshot.block_bytes", block_bytes)
         if block_bytes <= 0 or mgr is None:
             return {"total": 0, "gpu": 0, "cpu": 0}
 
@@ -270,6 +275,10 @@ class KVMetricsCollector:
         c_blocks = _get_used_blocks(mgr, "cpu")
         g = int(g_blocks) * int(block_bytes)
         c = int(c_blocks) * int(block_bytes)
+
+        _kvdbg("snapshot.blocks", {"g_blocks": g_blocks, "c_blocks": c_blocks})
+        _kvdbg("snapshot.bytes", out)
+
         return {"total": g + c, "gpu": g, "cpu": c}
 
     def snapshot_kv(self, phase: str, request_id: str) -> None:
@@ -289,6 +298,7 @@ class KVMetricsCollector:
         with self._lock:
             rec = self._req.get(request_id)
             if not rec:
+                _kvdbg("snapshot_kv.missing_rec", {"rid": request_id})
                 return
 
             # Write into the record (dict-first; fallback to attribute if not a dict)
@@ -308,6 +318,11 @@ class KVMetricsCollector:
                     self._agg["peak_kv_bytes_total"] = total
             except Exception:
                 pass
+
+            _kvdbg("snapshot_kv.write", {
+                "rid": request_id, "phase": phase,
+                key_total: total, key_gpu: gpu, key_cpu: cpu
+            })
 
     
     def on_enqueue(self, request_id: str, context_len: int, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -543,6 +558,12 @@ def _get_core_scheduler_manager(eng):
         core = core.engine_core
     sched = getattr(core, "scheduler", None) if core is not None else None
     mgr = getattr(sched, "kv_cache_manager", None) if sched is not None else None
+
+    # for debugging
+    _kvdbg("resolve.core", type(core).__name__ if core else None)
+    _kvdbg("resolve.sched", type(sched).__name__ if sched else None)
+    _kvdbg("resolve.mgr", type(mgr).__name__ if mgr else None)
+
     return core, sched, mgr
 
 def _dtype_bytes(dtype_str: str | None) -> int:
@@ -628,14 +649,20 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
     dev = (device or "gpu").lower()
     bp = getattr(mgr, "block_pool", None) or getattr(mgr, "pool", None)
 
+    # for debugging
+    _kvdbg(f"used_blocks[{d}]", "no block_pool")
+
     if dev == "gpu" and bp is not None::
         total = getattr(bp, "num_gpu_blocks", None)
         get_free = getattr(bp, "get_num_free_blocks", None)
         if isinstance(total, int) and callable(get_free):
             try:
                 free = int(get_free())
+                used = max(0, int(total) - free)
+                _kvdbg("used_blocks[gpu]", {"total": int(total), "free": free, "used": used})
                 return max(0, int(total) - free)
-            except Exception:
+            except Exception as e:
+                _kvdbg("used_blocks[gpu].err", str(e))
                 return 0
 
     if dev == "cpu" and bp is not None::
@@ -649,4 +676,19 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
                 return 0
         return 0
 
+    _kvdbg(f"used_blocks[{d}]", "unsupported device")
     return 0
+
+def _kvdbg(tag: str, payload=None):
+    if payload is None:
+        print(f"[KVDBG] {tag}", flush=True)
+    else:
+        try:
+            # compact JSON for structures
+            if isinstance(payload, (dict, list, tuple)):
+                s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                print(f"[KVDBG] {tag} {s}", flush=True)
+            else:
+                print(f"[KVDBG] {tag} {payload}", flush=True)
+        except Exception:
+            print(f"[KVDBG] {tag} {payload}", flush=True)

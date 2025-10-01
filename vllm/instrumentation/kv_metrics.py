@@ -602,65 +602,56 @@ def _dtype_bytes(dtype_str: str | None) -> int:
 
 def _infer_block_bytes(eng: Any) -> int:
     """Compute bytes per KV block from model/cache config."""
-    # block_size
-    bs = _get_attr_any(eng, ["cache_config", "vllm_config"])
-    block_size = None
-    if bs is not None and hasattr(bs, "block_size"):
-        block_size = getattr(bs, "block_size")
-    if block_size is None:
-        block_size = _get_attr_any(eng, ["block_size", "kv_block_size", "cache_block_size"])
+    core = getattr(eng, "engine_core", eng)
+    vcfg = getattr(core, "vllm_config", None)
+    mconf = getattr(vcfg, "model_config", None) if vcfg else None
+    hf   = getattr(mconf, "hf_config", None)   if mconf else None
+    cc   = getattr(vcfg, "cache_config", None) if vcfg else None
+
+    # --- block size ---
+    block_size = getattr(cc, "block_size", None)
     try:
         block_size = int(block_size) if block_size is not None else 16
     except Exception:
         block_size = 16
 
-    # model config / hf config (layers, heads, head_dim)
-    mc = _get_attr_any(eng, ["model_config"]) or _get_attr_any(eng, ["vllm_config"])
-    hf = None
-    for name in ("hf_config", "config"):
-        if mc is not None and hasattr(mc, name):
-            hf = getattr(mc, name)
-            break
-
-    num_layers = _get_attr_any(hf, ["num_hidden_layers", "n_layer"]) or \
-                 _get_attr_any(mc, ["num_hidden_layers"])
-    num_layers = int(num_layers) if num_layers is not None else 0
-
-    n_kv_heads = _get_attr_any(hf, ["num_key_value_heads", "n_kv_heads"]) or \
-                 _get_attr_any(mc, ["num_key_value_heads", "n_kv_heads"])
-    n_heads = _get_attr_any(hf, ["num_attention_heads", "n_head"]) or \
-              _get_attr_any(mc, ["num_attention_heads", "n_head"])
-    if n_kv_heads is None and n_heads is not None:
-        n_kv_heads = int(n_heads)  # fallback (no GQA info)
-    n_kv_heads = int(n_kv_heads) if n_kv_heads is not None else 0
-
-    head_dim = _get_attr_any(hf, ["head_dim"])
+    # --- model params ---
+    def g(o, *keys):
+        for k in keys:
+            if o is not None and hasattr(o, k):
+                return getattr(o, k)
+        return None
+    num_layers = g(hf, "num_hidden_layers", "n_layer") or g(mconf, "num_hidden_layers") or 0
+    n_heads    = g(hf, "num_attention_heads", "n_head") or g(mconf, "num_attention_heads") or 0
+    n_kv       = g(hf, "num_key_value_heads", "n_kv_heads") or g(mconf, "num_key_value_heads") or 0
+    head_dim   = g(hf, "head_dim")
     if head_dim is None:
-        hidden = _get_attr_any(hf, ["hidden_size", "n_embd"])
-        if hidden is not None and n_heads:
-            try:
-                head_dim = int(hidden) // int(n_heads)
-            except Exception:
-                head_dim = None
-    head_dim = int(head_dim) if head_dim is not None else 0
+        hidden_size = g(hf, "hidden_size", "n_embd") or g(mconf, "hidden_size")
+        if hidden_size and n_heads:
+            head_dim = int(hidden_size) // int(n_heads)
+    head_dim = int(head_dim or 0)
 
-    # KV dtype: prefer explicit kv_cache dtype; else engine/meta dtype
-    kv_dtype = None
-    cc = _get_attr_any(eng, ["cache_config"])
-    if cc is not None:
-        kv_dtype = _get_attr_any(cc, ["kv_cache_dtype"]) or _get_attr_any(cc, ["dtype"])
-    if kv_dtype is None:
-        kv_dtype = _get_attr_any(mc, ["dtype"])
-    byte_per = _dtype_bytes(str(kv_dtype) if kv_dtype else None)
-    if byte_per == 0:
-        # In practice KV cache is fp16/bf16 even for AWQ; default to 2B.
-        byte_per = 2
+    # --- dtype -> bytes per element ---
+    kv_dtype = g(cc, "kv_cache_dtype") or g(cc, "dtype")
+    bpe = 2  # default fp16/bf16
+    if kv_dtype:
+        s = str(kv_dtype).lower()
+        if "32" in s: bpe = 4
+        elif "8" in s or "fp8" in s or "e4m3" in s or "e5m2" in s or "int8" in s: bpe = 1
 
-    # KV bytes = 2 (K & V) * heads * head_dim * bytes * block_size * num_layers
-    try:
-        return int(2 * n_kv_heads * head_dim * byte_per * block_size * num_layers)
-    except Exception:
-        return 0
+    bytes_per_token = int(num_layers) * int(n_kv) * head_dim * 2 * int(bpe)
+    block_bytes = int(block_size) * bytes_per_token
+
+    # helpful debug (당분간 유지)
+    _kvdbg("block_bytes.inputs", {
+        "block_size": block_size,
+        "num_layers": int(num_layers),
+        "n_kv_heads": int(n_kv),
+        "n_heads": int(n_heads),
+        "head_dim": int(head_dim),
+        "dtype_bytes": int(bpe),
+    })
+    return int(block_bytes)
 
 def _get_used_blocks(mgr: Any, device: str) -> int:
     """Return number of used KV blocks for the given device.

@@ -58,6 +58,10 @@ class RequestLog:
     kv_bytes_gpu_at_decode: Optional[int] = None
     kv_bytes_cpu_at_decode: Optional[int] = None
 
+    # Token-based KV size (for transparency; not used for scheduling)
+    kv_token_bytes_est_at_prefill: Optional[int] = None
+    kv_token_bytes_est_at_decode: Optional[int] = None
+
 
 class _SafeJsonWriter:
     """Thread-safe append-only JSONL writer (dir + filename)."""
@@ -114,7 +118,7 @@ class _SafeJsonWriter:
 class KVMetricsConfig:
     """Config driven by CLI/env.
     Enablement accepts: on/true/1/yes (case-insensitive)."""
-    def __init__(self,
+    def __init__(self,``
                  mode: Optional[str] = None,
                  out_dir: Optional[str] = None,
                  out_file: Optional[str] = None,
@@ -267,7 +271,7 @@ class KVMetricsCollector:
 
         # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
         block_bytes = _infer_block_bytes(eng)
-        _kvdbg("snapshot.block_bytes", block_bytes)
+        _kvdbg("snapshot.block_bytes_raw", block_bytes)
         if block_bytes <= 0 or mgr is None:
             return {"total": 0, "gpu": 0, "cpu": 0}
 
@@ -301,16 +305,29 @@ class KVMetricsCollector:
             if not rec:
                 _kvdbg("snapshot_kv.missing_rec", {"rid": request_id})
                 return
+            # --- token-based estimation using known token counts in rec ---
+            ctx = int(getattr(rec, "context_len", 0) or 0)
+            gen = int(getattr(rec, "generated_len", 0) or 0)
+            _, est_prefill, est_decode = _est_bytes_from_tokens(self._engine_ref, ctx, gen)
+            est_token_bytes = est_prefill if phase == "prefill" else est_decode
+
+            try:
+                blk_bytes = _infer_block_bytes(self._engine_ref)
+                _kvdbg("snapshot.block_bytes", f"{blk_bytes} (token≈{int(est_token_bytes)})")
+            except Exception:
+                pass
 
             # Write into the record (dict-first; fallback to attribute if not a dict)
             if isinstance(rec, dict):
                 rec[key_total] = total
                 rec[key_gpu]   = gpu
                 rec[key_cpu]   = cpu
+                rec[f"kv_token_bytes_est_at_{phase}"] = int(est_token_bytes)
             else:
                 setattr(rec, key_total, total)
                 setattr(rec, key_gpu,   gpu)
                 setattr(rec, key_cpu,   cpu)
+                setattr(rec, f"kv_token_bytes_est_at_{phase}", int(est_token_bytes))
 
             # Maintain peak for summary
             try:
@@ -322,7 +339,8 @@ class KVMetricsCollector:
 
             _kvdbg("snapshot_kv.write", {
                 "rid": request_id, "phase": phase,
-                key_total: total, key_gpu: gpu, key_cpu: cpu
+                key_total: total, key_gpu: gpu, key_cpu: cpu,
+                f"kv_token_bytes_est_at_{phase}": int(est_token_bytes),
             })
 
     
@@ -600,6 +618,18 @@ def _dtype_bytes(dtype_str: str | None) -> int:
         return 1
     return 0
 
+def _est_bytes_from_tokens(eng: Any, context_len: int, generated_len: int) -> tuple[int, int, int]:
+    """Return (block_size, est_prefill_bytes, est_decode_bytes) using ceil-div block math."""
+    block_bytes = _infer_block_bytes(eng)
+    vcfg = getattr(eng, "vllm_config", None)
+    cc   = getattr(vcfg, "cache_config", None) if vcfg else None
+    block_size = getattr(cc, "block_size", 16) if cc else 16
+    # ceil division
+    def cdiv(a, b): return (int(a) + int(b) - 1) // int(b)
+    pre_blocks = cdiv(int(context_len), int(block_size))
+    dec_blocks = cdiv(int(context_len) + int(generated_len), int(block_size))
+    return int(block_size), pre_blocks * block_bytes, dec_blocks * block_bytes
+
 def _infer_block_bytes(eng: Any) -> int:
     """Compute bytes per KV block from model/cache config."""
     core = getattr(eng, "engine_core", eng)
@@ -642,7 +672,7 @@ def _infer_block_bytes(eng: Any) -> int:
     bytes_per_token = int(num_layers) * int(n_kv) * head_dim * 2 * int(bpe)
     block_bytes = int(block_size) * bytes_per_token
 
-    # helpful debug (당분간 유지)
+    # for debugging
     _kvdbg("block_bytes.inputs", {
         "block_size": block_size,
         "num_layers": int(num_layers),
@@ -690,6 +720,8 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
 
     _kvdbg(f"used_blocks[{dev}]", "unsupported device")
     return 0
+
+
 
 def _kvdbg(tag: str, payload=None):
     if payload is None:

@@ -62,6 +62,9 @@ class RequestLog:
     kv_token_bytes_est_at_prefill: Optional[int] = None
     kv_token_bytes_est_at_decode: Optional[int] = None
 
+    kv_bytes_total_peak_alloc: int | None = None
+    kv_bytes_gpu_peak_alloc:   int | None = None
+    kv_bytes_cpu_peak_alloc:   int | None = None
 
 class _SafeJsonWriter:
     """Thread-safe append-only JSONL writer (dir + filename)."""
@@ -436,6 +439,23 @@ class KVMetricsCollector:
             if rec:
                 rec.generated_len += 1
 
+    def bump_peak_alloc(self, request_id: str) -> None:
+        """Update per-request peak of block-based allocated bytes (GPU/CPU/Total)."""
+        if not self.cfg.enabled:
+            return
+        snap = self._kv_bytes_snapshot()  # {"total":..., "gpu":..., "cpu":...}
+        total = int(snap.get("total", 0))
+        gpu   = int(snap.get("gpu", 0))
+        cpu   = int(snap.get("cpu", 0))
+        with self._lock:
+            rec = self._req.get(str(request_id))
+            if rec is None:
+                return
+            rec.kv_bytes_total_peak_alloc = max(int(rec.kv_bytes_total_peak_alloc or 0), total)
+            rec.kv_bytes_gpu_peak_alloc   = max(int(rec.kv_bytes_gpu_peak_alloc or 0), gpu)
+            rec.kv_bytes_cpu_peak_alloc   = max(int(rec.kv_bytes_cpu_peak_alloc or 0), cpu)
+        _kvdbg("peak.bump", {"rid": str(request_id), "total": total, "gpu": gpu, "cpu": cpu})
+
     def _summary_path(self) -> str:
         """Return path to the summary file in the configured directory."""
         if self._writer is not None:
@@ -488,9 +508,9 @@ class _RunAggregator:
         if rec.ttft_ms is not None:
             self.ttft_list.append(float(rec.ttft_ms))
         # peak KV
-        for v in (rec.kv_bytes_total_at_prefill, rec.kv_bytes_total_at_decode):
-            if isinstance(v, int) and v > self.peak_kv_total:
-                self.peak_kv_total = v
+        peak = int(getattr(rec, "kv_bytes_total_peak_alloc", 0) or 0)
+        if peak > self.peak_kv_total:
+            self.peak_kv_total = peak
 
     def build_summary(self) -> dict:
         # token-weighted TPS

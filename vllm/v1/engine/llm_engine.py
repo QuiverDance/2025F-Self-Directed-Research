@@ -537,6 +537,8 @@ class LLMEngine:
                 if delta > 0:
                     for _ in range(delta):
                         self._kv_metrics.count_generated_token(rid, is_eos=False)
+                    self._kv_metrics.bump_peak_alloc(rid)
+                    
                 self._kv_last_len[rid] = cur_len
 
             # Finish detection: explicit flag or finish_reason.

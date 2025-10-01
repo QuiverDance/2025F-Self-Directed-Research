@@ -554,10 +554,14 @@ def _locate_kv_manager(eng: Any) -> Any:
 def _get_core_scheduler_manager(eng):
     """Return (core, scheduler, kv_cache_manager) using vLLM v1 fixed path."""
     # Normalize engine core (v1 stacks can be eng.engine_core.engine_core)
-    core = getattr(eng, "engine_core", None)
+    core = getattr(eng, "engine_core", eng)
     # unwrap multiple layers
     while core is not None and hasattr(core, "engine_core"):
-        core = getattr(core, "engine_core")
+        nxt = getattr(core, "engine_core")
+        # Break potential self-cycles defensively
+        if nxt is core:
+            break
+        core = nxt
 
     sched = getattr(core, "scheduler", None)
     if sched is None and hasattr(core, "model_executor"):

@@ -118,7 +118,7 @@ class _SafeJsonWriter:
 class KVMetricsConfig:
     """Config driven by CLI/env.
     Enablement accepts: on/true/1/yes (case-insensitive)."""
-    def __init__(self,``
+    def __init__(self,
                  mode: Optional[str] = None,
                  out_dir: Optional[str] = None,
                  out_file: Optional[str] = None,

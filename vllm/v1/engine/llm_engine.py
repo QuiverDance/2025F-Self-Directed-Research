@@ -408,6 +408,71 @@ class LLMEngine:
     def reset_prefix_cache(self, device: Optional[Device] = None):
         self.engine_core.reset_prefix_cache()
 
+    def reset_for_next_run(
+        self,
+        reset_metrics: bool = True,
+        relink_metrics: bool = True,
+        new_run_id: bool = True,
+        empty_cuda_cache: bool = False,
+    ) -> None:
+        """
+        Best-effort cleanup to release KV cache & GPU memory between runs.
+        """
+
+        # 1) request abort (if supported)
+        try:
+            self.engine_core.abort_requests([])  # 일부 버전에서 no-op
+        except Exception:
+            pass
+
+        # 2) reset caches
+        try:
+            self.reset_mm_cache()
+        except Exception:
+            pass
+        try:
+            self.reset_prefix_cache()
+        except Exception:
+            pass
+
+        # 3) invalidate + relink metrics collector
+        try:
+            if reset_metrics:
+                from vllm.instrumentation.kv_metrics import KVMetricsCollector
+                KVMetricsCollector.reset()
+            if new_run_id:
+                import time as _time, uuid as _uuid
+                self._run_id = _time.strftime("%Y%m%d-%H%M%S") + "-" + _uuid.uuid4().hex[:6]
+                try:
+                    if hasattr(self, "_kv_meta") and isinstance(self._kv_meta, dict):
+                        self._kv_meta["run_id"] = self._run_id
+                except Exception:
+                    pass
+            if relink_metrics:
+                from vllm.instrumentation.kv_metrics import KVMetricsCollector
+                col = KVMetricsCollector.get()
+                eng_like = getattr(self, "engine_core", None)
+                if hasattr(eng_like, "engine_core"):
+                    eng_like = eng_like.engine_core
+                try:
+                    col.link_engine(eng_like or self)
+                    self._kv_metrics = col
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 4) drop refs + cuda cache
+        if empty_cuda_cache:
+            try:
+                import torch, gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
 

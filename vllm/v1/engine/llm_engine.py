@@ -456,7 +456,7 @@ class LLMEngine:
             self.shutdown(empty_cuda_cache=True, reset_metrics=False)
         except Exception:
             pass
-            
+
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
@@ -627,3 +627,20 @@ class LLMEngine:
         except Exception:
             # never raise in cleanup
             pass
+    
+    def kv_used_gpu_blocks(self) -> int:
+        """Return current number of used GPU KV blocks (0 means fully freed)."""
+        try:
+            core = getattr(self.engine_core, "engine_core", self.engine_core)
+            sched = getattr(core, "scheduler", None) or getattr(
+                getattr(core, "model_executor", None), "scheduler", None)
+            mgr = None
+            if sched is not None:
+                for name in ("kv_cache_manager", "block_manager", "cache_manager"):
+                    mgr = getattr(sched, name, None) or mgr
+            bp = getattr(mgr, "block_pool", None)
+            if bp and hasattr(bp, "num_gpu_blocks") and hasattr(bp, "get_num_free_blocks"):
+                return int(bp.num_gpu_blocks) - int(bp.get_num_free_blocks())
+        except Exception:
+            pass
+        return 0

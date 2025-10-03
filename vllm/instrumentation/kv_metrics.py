@@ -19,6 +19,20 @@ def _now_ms_monotonic() -> float:
     """Monotonic milliseconds to avoid wall-clock jumps."""
     return time.monotonic_ns() / 1e6
 
+def _fmt_bytes(n: Optional[int]) -> Optional[str]:
+    if n is None:
+        return None
+    try:
+        v = float(int(n))
+    except Exception:
+        return None
+    units = ["B","KB","MB","GB","TB","PB"]
+    i = 0
+    while v >= 1024.0 and i < len(units)-1:
+        v /= 1024.0
+        i += 1
+    return f"{v:.2f} {units[i]}"
+
 @dataclass
 class RequestLog:
     # Required idenfitifiers / meta
@@ -412,7 +426,15 @@ class KVMetricsCollector:
                 if self._agg is not None:
                     self._agg.observe_request(rec)
                 payload = asdict(rec)
-                payload["ts"] = int(time.time() * 1000)  # ordering aid                
+                payload["ts"] = int(time.time() * 1000)  # ordering aid  
+                # Add human-readable fields alongside byte counts
+                for k, v in list(payload.items()):
+                    if (isinstance(v, int) and
+                        (k.startswith("kv_bytes_") or k.startswith("kv_token_bytes_est_") or k.endswith("_peak_alloc"))):
+                        hv = _fmt_bytes(v)
+                        if hv is not None:
+                            payload[k + "_human"] = hv
+
                 print("KV metrics.on_stream_end writing", payload)
                 self._writer.write(payload)
 

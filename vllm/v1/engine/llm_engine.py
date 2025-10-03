@@ -34,6 +34,8 @@ from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
+import time as _time, uuid as _uuid, os as _os
+
 # --- KV instrumentation (request-scoped, unified) ---
 from vllm.instrumentation.kv_metrics import (
     KVMetricsCollector,
@@ -80,6 +82,12 @@ class LLMEngine:
         self.stat_logger: Optional[StatLoggerBase] = None
         if self.log_stats:
             self.stat_logger = PrometheusStatLogger(vllm_config)
+
+        try:
+            KVMetricsCollector.reset()
+            self._run_id = _time.strftime("%Y%m%d-%H%M%S") + "-" + _uuid.uuid4().hex[:6]
+        except Exception:
+            self._run_id = None
 
         # important: init dp group before init the engine_core
         # In the decoupled engine case this is handled in EngineCoreProc.
@@ -147,6 +155,7 @@ class LLMEngine:
             "dtype": None,
             "num_devices": None,
             "block_size": None,
+            "run_id": getattr(self, "_run_id", None),
         }
         # dtype
         try:
@@ -443,6 +452,11 @@ class LLMEngine:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
     def __del__(self):
+        try:
+            self.shutdown(empty_cuda_cache=True, reset_metrics=False)
+        except Exception:
+            pass
+            
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
@@ -560,3 +574,56 @@ class LLMEngine:
                 self._kv_on_request_end(rid)
                 self._kv_last_len.pop(rid, None)
                 self._kv_seen_first.discard(rid)
+    
+    def shutdown(self, empty_cuda_cache: bool = True, reset_metrics: bool = True) -> None:
+        """Best-effort cleanup to release KV cache & GPU memory between runs."""
+        try:
+            # Abort any dangling requests (if API present)
+            try:
+                self.engine_core.abort_requests([])  # no-op guard
+            except Exception:
+                pass
+
+            # Clear caches
+            try:
+                self.reset_mm_cache()
+            except Exception:
+                pass
+            try:
+                self.reset_prefix_cache()
+            except Exception:
+                pass
+
+            # Downstream shutdown hooks if they exist
+            for name in ("shutdown", "close"):
+                if hasattr(self.engine_core, name):
+                    try:
+                        getattr(self.engine_core, name)()
+                    except Exception:
+                        pass
+
+            # Drop refs + CUDA cache
+            import gc
+            try:
+                delattr(self, "engine_core")
+            except Exception:
+                pass
+            gc.collect()
+            if empty_cuda_cache:
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+            if reset_metrics:
+                try:
+                    from vllm.instrumentation.kv_metrics import KVMetricsCollector
+                    KVMetricsCollector.reset()
+                except Exception:
+                    pass
+        except Exception:
+            # never raise in cleanup
+            pass

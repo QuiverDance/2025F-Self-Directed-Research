@@ -417,12 +417,15 @@ class LLMEngine:
     ) -> None:
         """Soft reset between runs without destroying the engine.
         1) Abort ALL active requests
-        2) Clear MM/prefix caches (return KV blocks to free pool)
-        3) Deep-free KV pool if any block remains
-        4) (Optional) Reset metrics, stamp new run_id, relink collector
-        5) (Optional) Empty CUDA cache (engine stays alive)
+        2) Drain scheduler steps until requests & KV frees settle
+        3) Clear MM/prefix caches (return KV blocks to free pool)
+        4) Deep-free KV pool if any block remains
+        5) (Optional) Reset metrics, stamp new run_id, relink collector
+        6) (Optional) Empty CUDA cache (engine stays alive)
         """
-        # A) abort all known active requests
+        import time as _t, gc as _gc
+
+        # --- A) 수집 → abort (OutputProcessor 경유 버전 사용) -----------------
         try:
             ids = []
             core = getattr(self, "engine_core", self)
@@ -430,13 +433,15 @@ class LLMEngine:
                 core = core.engine_core
             sched = getattr(core, "scheduler", None) or getattr(
                 getattr(core, "model_executor", None), "scheduler", None)
+
             containers = ("running","_running","waiting","_waiting",
                         "paused","_paused","swapped","_swapped",
                         "req_queue","request_queue")
             seen = set()
             for attr in containers:
                 q = getattr(sched, attr, None)
-                if q is None: continue
+                if q is None:
+                    continue
                 try:
                     it = list(q.values()) if hasattr(q, "values") else list(q)
                 except Exception:
@@ -458,73 +463,112 @@ class LLMEngine:
                         except Exception:
                             pass
             ids = list(seen)
-            if ids and hasattr(self.engine_core, "abort_requests"):
-                self.engine_core.abort_requests(ids)
+            if ids:
+                # 중요: OutputProcessor 경유 abort → 엔진/디토크나이저/메트릭 동시 정리
+                try:
+                    self.abort_request(ids)
+                except Exception:
+                    # fallback: 코어로 직접
+                    self.engine_core.abort_requests(ids)
         except Exception:
             pass
 
-        # B) clear caches
+        # --- B) drain loop: abort가 실제 free로 반영되게 step() 돌림 ------------
+        try:
+            # DP 등에서 dummy batch가 필요하면 내부적으로 step에서 처리됨. (파일의 step() 참고) :contentReference[oaicite:1]{index=1}
+            max_steps = 16
+            for _ in range(max_steps):
+                # 아직 미완료가 남았거나(출력파이프), used 블록이 남아있으면 step
+                more = False
+                try:
+                    if self.has_unfinished_requests():
+                        more = True
+                except Exception:
+                    pass
+                try:
+                    # 사용 중 블록(used) 확인 헬퍼
+                    def _used_blocks() -> int:
+                        try:
+                            core2 = getattr(self, "engine_core", self)
+                            if hasattr(core2, "engine_core"):
+                                core2 = core2.engine_core
+                            sched2 = getattr(core2, "scheduler", None) or getattr(
+                                getattr(core2, "model_executor", None), "scheduler", None)
+                            mgr2 = None
+                            if sched2 is not None:
+                                for name in ("kv_cache_manager","block_manager","cache_manager"):
+                                    mgr2 = getattr(sched2, name, None) or mgr2
+                            bp2 = getattr(mgr2, "block_pool", None)
+                            if bp2 is not None:
+                                total = getattr(bp2, "num_gpu_blocks", None) or getattr(bp2, "num_blocks", None) or 0
+                                free = 0
+                                if hasattr(bp2, "get_num_free_blocks"):
+                                    free = int(bp2.get_num_free_blocks())
+                                elif hasattr(bp2, "num_free_gpu_blocks"):
+                                    free = int(getattr(bp2, "num_free_gpu_blocks"))
+                                return int(total) - int(free)
+                        except Exception:
+                            pass
+                        return 0
+                    if _used_blocks() > 0:
+                        more = True
+                except Exception:
+                    pass
+
+                if not more:
+                    break
+
+                try:
+                    # 한 번 step. (엔진이 할 게 없으면 []만 반환)
+                    self.step()
+                except Exception:
+                    # 엔진이 잠들었으면 깨웠다가 한 템포 기다림
+                    try:
+                        self.wake_up()
+                    except Exception:
+                        pass
+                    _t.sleep(0.01)
+            # drain 후 한 템포
+            _t.sleep(0.01)
+        except Exception:
+            pass
+
+        # --- C) 캐시 비우기(한 번 더) ------------------------------------------
         for fn in ("reset_mm_cache", "reset_prefix_cache"):
             try:
                 getattr(self, fn)()
             except Exception:
                 pass
 
-        # C) deep free KV pool
+        # --- D) deep-free: 남아있으면 매니저/풀 레벨 리셋 시도 -------------------
         try:
-            def _used_blocks() -> int:
-                try:
-                    core2 = getattr(self, "engine_core", self)
-                    if hasattr(core2, "engine_core"):
-                        core2 = core2.engine_core
-                    sched2 = getattr(core2, "scheduler", None) or getattr(
-                        getattr(core2, "model_executor", None), "scheduler", None)
-                    mgr2 = None
-                    if sched2 is not None:
-                        for name in ("kv_cache_manager","block_manager","cache_manager"):
-                            mgr2 = getattr(sched2, name, None) or mgr2
-                    bp2 = getattr(mgr2, "block_pool", None)
-                    if bp2 is not None:
-                        total = getattr(bp2, "num_gpu_blocks", None) or getattr(bp2, "num_blocks", None) or 0
-                        free = 0
-                        if hasattr(bp2, "get_num_free_blocks"):
-                            free = int(bp2.get_num_free_blocks())
-                        elif hasattr(bp2, "num_free_gpu_blocks"):
-                            free = int(getattr(bp2, "num_free_gpu_blocks"))
-                        return int(total) - int(free)
-                except Exception:
-                    pass
-                return 0
-
-            if _used_blocks() > 0:
-                core2 = getattr(self, "engine_core", self)
-                if hasattr(core2, "engine_core"):
-                    core2 = core2.engine_core
-                sched2 = getattr(core2, "scheduler", None) or getattr(
-                    getattr(core2, "model_executor", None), "scheduler", None)
-                mgr2 = None
-                if sched2 is not None:
-                    for name in ("kv_cache_manager","block_manager","cache_manager"):
-                        mgr2 = getattr(sched2, name, None) or mgr2
-                for cand in ("reset","reset_cache","reset_kv_cache","free_all_blocks"):
-                    if hasattr(mgr2, cand):
-                        try: getattr(mgr2, cand)()
-                        except Exception: pass
-                bp2 = getattr(mgr2, "block_pool", None)
-                for cand in ("reset","reset_cache","reset_kv_cache","free_all_blocks"):
-                    if hasattr(bp2, cand):
-                        try: getattr(bp2, cand)()
-                        except Exception: pass
+            core3 = getattr(self, "engine_core", self)
+            if hasattr(core3, "engine_core"):
+                core3 = core3.engine_core
+            sched3 = getattr(core3, "scheduler", None) or getattr(
+                getattr(core3, "model_executor", None), "scheduler", None)
+            mgr3 = None
+            if sched3 is not None:
+                for name in ("kv_cache_manager","block_manager","cache_manager"):
+                    mgr3 = getattr(sched3, name, None) or mgr3
+            for cand in ("reset","reset_cache","reset_kv_cache","free_all_blocks"):
+                if hasattr(mgr3, cand):
+                    try: getattr(mgr3, cand)()
+                    except Exception: pass
+            bp3 = getattr(mgr3, "block_pool", None)
+            for cand in ("reset","reset_cache","reset_kv_cache","free_all_blocks"):
+                if hasattr(bp3, cand):
+                    try: getattr(bp3, cand)()
+                    except Exception: pass
         except Exception:
             pass
 
-        # D) metrics/run_id/relink
+        # --- E) metrics/run_id/relink ------------------------------------------
         try:
             if reset_metrics:
                 from vllm.instrumentation.kv_metrics import KVMetricsCollector
                 KVMetricsCollector.reset()
             if new_run_id:
-                import time as _time, uuid as _uuid
                 rid = _time.strftime("%Y%m%d-%H%M%S") + "-" + _uuid.uuid4().hex[:6]
                 setattr(self, "_run_id", rid)
                 if hasattr(self, "_kv_meta") and isinstance(self._kv_meta, dict):
@@ -532,27 +576,28 @@ class LLMEngine:
             if relink_metrics:
                 from vllm.instrumentation.kv_metrics import KVMetricsCollector
                 col = KVMetricsCollector.get()
-                core3 = getattr(self, "engine_core", self)
-                if hasattr(core3, "engine_core"):
-                    core3 = core3.engine_core
+                core4 = getattr(self, "engine_core", self)
+                if hasattr(core4, "engine_core"):
+                    core4 = core4.engine_core
                 try:
-                    col.link_engine(core3 or self)
+                    col.link_engine(core4 or self)
                     setattr(self, "_kv_metrics", col)
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # E) optional CUDA cache
+        # --- F) (옵션) CUDA 캐시 -----------------------------------------------
         if empty_cuda_cache:
             try:
                 import torch
-                gc.collect()
+                _gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
             except Exception:
                 pass
+
 
 
     def sleep(self, level: int = 1):

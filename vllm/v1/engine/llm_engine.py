@@ -408,13 +408,8 @@ class LLMEngine:
     def reset_prefix_cache(self, device: Optional[Device] = None):
         self.engine_core.reset_prefix_cache()
 
-    def reset_for_next_run(
-        self,
-        reset_metrics: bool = True,
-        relink_metrics: bool = True,
-        new_run_id: bool = True,
-        empty_cuda_cache: bool = False,
-    ) -> None:
+    def reset_for_next_run(self, reset_metrics: bool = True,relink_metrics: bool = True,
+            new_run_id: bool = True,empty_cuda_cache: bool = False,) -> None:
         """
         Best-effort cleanup to release KV cache & GPU memory between runs.
         """

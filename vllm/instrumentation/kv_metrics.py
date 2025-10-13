@@ -196,13 +196,24 @@ class KVMetricsCollector:
 
     _instance: Optional["KVMetricsCollector"] = None
     _init_lock = threading.Lock()
-
     
     @classmethod
     def reset(cls) -> None:
         """Reset the singleton (useful for tests)."""
         with cls._init_lock:
             cls._instance = None
+
+        inst = cls._get_or_create_singleton()
+        # hard reset of aggregate counters
+        inst._num_requests = 0
+        inst.total_context = 0
+        inst.total_generated = 0
+        inst.total_prefill_ms = 0.0
+        inst.total_decode_ms = 0.0
+        inst.ttft_list = []
+        inst.peak_kv_total = 0
+        if hasattr(inst, "_req_stats"):
+            inst._req_stats = []
 
     @classmethod
     def get(cls, config: Optional[KVMetricsConfig] = None) -> "KVMetricsCollector":
@@ -249,6 +260,7 @@ class KVMetricsCollector:
         self._lock = threading.Lock()
         # Track inflight requests so we can write summary immediately when all finish.
         self._inflight: set[str] = set()
+        self._req_stats = []
 
         self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
         # register atexit once per process
@@ -435,6 +447,31 @@ class KVMetricsCollector:
                         if hv is not None:
                             payload[k + "_human"] = hv
 
+                try:
+                    ct = (payload.get("context_tokens")
+                        or payload.get("num_prompt_tokens")
+                        or payload.get("input_tokens"))
+                    gt = (payload.get("generated_tokens")
+                        or payload.get("num_generated_tokens")
+                        or payload.get("output_tokens"))
+                    pre_ms = payload.get("prefill_ms")
+                    dec_ms = payload.get("decode_ms")
+                    ttft = (payload.get("ttft_ms")
+                            or payload.get("time_to_first_token_ms"))
+                    kv_peak = (payload.get("kv_bytes_peak_total")
+                            or payload.get("kv_bytes_total_peak")
+                            or payload.get("kv_bytes_gpu_peak_total"))
+                    self._req_stats.append({
+                        "context_tokens": int(ct) if ct is not None else None,
+                        "generated_tokens": int(gt) if gt is not None else None,
+                        "prefill_ms": float(pre_ms) if pre_ms is not None else None,
+                        "decode_ms": float(dec_ms) if dec_ms is not None else None,
+                        "ttft_ms": float(ttft) if ttft is not None else None,
+                        "kv_peak_bytes": int(kv_peak) if kv_peak is not None else None,
+                    })
+                except Exception:
+                    pass
+
                 print("KV metrics.on_stream_end writing", payload)
                 self._writer.write(payload)
 
@@ -535,26 +572,93 @@ class _RunAggregator:
             self.peak_kv_total = peak
 
     def build_summary(self) -> dict:
+
+        def _pct(arr, q):
+            if not arr:
+                return None
+            arr = sorted(arr)
+            k = (len(arr) - 1) * q
+            f = math.floor(k); c = math.ceil(k)
+            if f == c:
+                return arr[int(k)]
+            return arr[f] * (c - k) + arr[c] * (k - f)
+
+        def _valid(nums):
+            out = []
+            for x in nums:
+                if x is None:
+                    continue
+                if isinstance(x, (int, float)):
+                    if math.isfinite(float(x)):
+                        out.append(float(x))
+            return out
+
+        def _mean(x):
+            return (sum(x) / len(x)) if x else None
+
         # token-weighted TPS
         tps_prefill = (self.total_context / (self.total_prefill_ms / 1000.0)
                        if self.total_context > 0 and self.total_prefill_ms >= 1.0 else None)
         tps_decode = (self.total_generated / (self.total_decode_ms / 1000.0)
                       if self.total_generated > 0 and self.total_decode_ms >= 1.0 else None)
-        ttft_p50 = median(self.ttft_list) if self.ttft_list else None
-        # p90 (simple, robust even for small N)
-        ttft_p90 = None
-        if self.ttft_list:
-            arr = sorted(self.ttft_list)
-            idx = max(0, int(round(0.90 * (len(arr) - 1))))
-            ttft_p90 = arr[idx]
-        return {
-            "num_requests": self._num_requests,
+        
+        ttft_list = list(getattr(self, "ttft_list", []) or [])
+        ttft_p50 = _pct(ttft_list, 0.50) if ttft_list else None
+        ttft_p90 = _pct(ttft_list, 0.90) if ttft_list else None
+        
+        reqs = [r for r in getattr(self, "_req_stats", []) if isinstance(r, dict)]
+        prefill_tps_per_req, decode_tps_per_req, latency_ms = [], [], []
+        ctx_list = _valid([r.get("context_tokens") for r in reqs])
+        gen_list = _valid([r.get("generated_tokens") for r in reqs])
+        kvp_list = _valid([r.get("kv_peak_bytes") for r in reqs])
+        ttft_req = _valid([r.get("ttft_ms") for r in reqs])
+
+        for r in reqs:
+            pre_ms, dec_ms = r.get("prefill_ms"), r.get("decode_ms")
+            ctok, gtok = r.get("context_tokens"), r.get("generated_tokens")
+            if pre_ms and pre_ms > 0 and ctok:
+                prefill_tps_per_req.append(ctok / (pre_ms / 1000.0))
+            if dec_ms and dec_ms > 0 and gtok:
+                decode_tps_per_req.append(gtok / (dec_ms / 1000.0))
+            if pre_ms is not None or dec_ms is not None:
+                a = float(pre_ms or 0.0) + float(dec_ms or 0.0)
+                latency_ms.append(a)
+
+        out = {
+            "num_requests": getattr(self, "_num_requests", len(reqs)),
             "tps_prefill_token_weighted": tps_prefill,
             "tps_decode_token_weighted": tps_decode,
             "ttft_ms_p50": ttft_p50,
             "ttft_ms_p90": ttft_p90,
-            "peak_kv_bytes_total": self.peak_kv_total,
+            "peak_kv_bytes_total": getattr(self, "peak_kv_total", None),
+
+            "avg_prefill_tps": _mean(prefill_tps_per_req),
+            "avg_decode_tps": _mean(decode_tps_per_req),
+
+            "avg_ttft_ms_per_req": _mean(ttft_req),
+            "p50_ttft_ms_per_req": _pct(ttft_req, 0.50) if ttft_req else None,
+            "p90_ttft_ms_per_req": _pct(ttft_req, 0.90) if ttft_req else None,
+
+            "avg_latency_ms_per_req": _mean(latency_ms),
+            "p50_latency_ms_per_req": _pct(latency_ms, 0.50) if latency_ms else None,
+            "p90_latency_ms_per_req": _pct(latency_ms, 0.90) if latency_ms else None,
+
+            "avg_context_tokens_per_req": _mean(ctx_list),
+            "avg_generated_tokens_per_req": _mean(gen_list),
+
+            "avg_kv_peak_bytes_per_req": _mean(kvp_list),
+            "max_kv_peak_bytes_per_req": (max(kvp_list) if kvp_list else None),
         }
+
+        for _k in ("peak_kv_bytes_total", "avg_kv_peak_bytes_per_req", "max_kv_peak_bytes_per_req"):
+            _v = out.get(_k)
+            try:
+                if _v is not None:
+                    out[_k + "_human"] = _fmt_bytes(int(float(_v)))
+            except Exception:
+                pass
+
+        return out
 
 
 def _get_attr_any(obj: Any, names: list[str]):

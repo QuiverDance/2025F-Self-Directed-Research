@@ -423,9 +423,10 @@ class LLMEngine:
         5) (Optional) Reset metrics, stamp new run_id, relink collector
         6) (Optional) Empty CUDA cache (engine stays alive)
         """
+        self._begin_new_run()
+
         import time as _t, gc as _gc
 
-        # --- A) 수집 → abort (OutputProcessor 경유 버전 사용) -----------------
         try:
             ids = []
             core = getattr(self, "engine_core", self)
@@ -464,21 +465,16 @@ class LLMEngine:
                             pass
             ids = list(seen)
             if ids:
-                # 중요: OutputProcessor 경유 abort → 엔진/디토크나이저/메트릭 동시 정리
                 try:
                     self.abort_request(ids)
                 except Exception:
-                    # fallback: 코어로 직접
                     self.engine_core.abort_requests(ids)
         except Exception:
             pass
 
-        # --- B) drain loop: abort가 실제 free로 반영되게 step() 돌림 ------------
         try:
-            # DP 등에서 dummy batch가 필요하면 내부적으로 step에서 처리됨. (파일의 step() 참고) :contentReference[oaicite:1]{index=1}
             max_steps = 16
             for _ in range(max_steps):
-                # 아직 미완료가 남았거나(출력파이프), used 블록이 남아있으면 step
                 more = False
                 try:
                     if self.has_unfinished_requests():
@@ -486,7 +482,6 @@ class LLMEngine:
                 except Exception:
                     pass
                 try:
-                    # 사용 중 블록(used) 확인 헬퍼
                     def _used_blocks() -> int:
                         try:
                             core2 = getattr(self, "engine_core", self)
@@ -519,28 +514,23 @@ class LLMEngine:
                     break
 
                 try:
-                    # 한 번 step. (엔진이 할 게 없으면 []만 반환)
                     self.step()
                 except Exception:
-                    # 엔진이 잠들었으면 깨웠다가 한 템포 기다림
                     try:
                         self.wake_up()
                     except Exception:
                         pass
                     _t.sleep(0.01)
-            # drain 후 한 템포
             _t.sleep(0.01)
         except Exception:
             pass
 
-        # --- C) 캐시 비우기(한 번 더) ------------------------------------------
         for fn in ("reset_mm_cache", "reset_prefix_cache"):
             try:
                 getattr(self, fn)()
             except Exception:
                 pass
 
-        # --- D) deep-free: 남아있으면 매니저/풀 레벨 리셋 시도 -------------------
         try:
             core3 = getattr(self, "engine_core", self)
             if hasattr(core3, "engine_core"):
@@ -563,7 +553,6 @@ class LLMEngine:
         except Exception:
             pass
 
-        # --- E) metrics/run_id/relink ------------------------------------------
         try:
             if reset_metrics:
                 from vllm.instrumentation.kv_metrics import KVMetricsCollector
@@ -587,7 +576,6 @@ class LLMEngine:
         except Exception:
             pass
 
-        # --- F) (옵션) CUDA 캐시 -----------------------------------------------
         if empty_cuda_cache:
             try:
                 import torch
@@ -598,7 +586,31 @@ class LLMEngine:
             except Exception:
                 pass
 
+    def _begin_new_run(self) -> None:
+        """Always reset metrics and stamp a new run_id. No flags needed."""
+        try:
+            from vllm.instrumentation.kv_metrics import KVMetricsCollector
+            import time as _time, uuid as _uuid
+            # 1) reset metrics singleton (hard)
+            KVMetricsCollector.reset()
 
+            # 2) new run id
+            self._run_id = _time.strftime("%Y%m%d-%H%M%S") + "-" + _uuid.uuid4().hex[:6]
+            if hasattr(self, "_kv_meta") and isinstance(getattr(self, "_kv_meta"), dict):
+                self._kv_meta["run_id"] = self._run_id
+
+            # 3) relink collector to current engine core
+            col = KVMetricsCollector.get()
+            eng_like = getattr(self, "engine_core", None) or self
+            if hasattr(eng_like, "engine_core"):
+                eng_like = eng_like.engine_core
+            try:
+                col.link_engine(eng_like)
+                self._kv_metrics = col
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
@@ -702,7 +714,7 @@ class LLMEngine:
         print("[KVCHK-END] done", request_id)
 
     def _kv_observe_processed_outputs(self, processed_outputs: Any) -> None:
-        print("[KVCHK-OBS] enter, n_ro=", len(getattr(processed_outputs, "request_outputs", []) or []))
+        # print("[KVCHK-OBS] enter, n_ro=", len(getattr(processed_outputs, "request_outputs", []) or []))
         """Observe streaming to (a) detect first token, (b) count tokens, and
         (c) detect completion to flush metrics. Uses minimal assumptions about
         RequestOutput structure for version tolerance."""

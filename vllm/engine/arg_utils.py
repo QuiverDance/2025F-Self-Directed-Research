@@ -913,26 +913,20 @@ class EngineArgs:
         vllm_group.add_argument("--additional-config",
                                 **vllm_kwargs["additional_config"])
 
-        # Other arguments
-        parser.add_argument('--disable-log-stats',
-                            action='store_true',
-                            help='Disable logging statistics.')
-
-        group = parser.add_argument_group("KV Metrics (baseline)")
-        group.add_argument(
-            "--kv-metrics",
-            type=str,
-            default="off",
-            choices=["off", "baseline"],
-            help="Enable baseline request-scoped KV/latency metrics.",
-        )
-        group.add_argument(
-            "--kv-metrics-path",
-            type=str,
-            default=None,
-            help="Path to JSONL output file for KV baseline metrics. "
-                "Default: ./runs/kv_baseline.jsonl (or $VLLM_KV_METRICS_PATH).",
-        )
+        # Register KV-quantization related CLI flags for v1 engine.
+        quantization_group = parser.add_argument_group("KV Cache Quantization (KVTuner-style)")
+        quantization_group.add_argument("--kv-quant-enable", action="store_true",
+                        help="Enable per-layer K/V-bit quantized KV cache (2/4/8bit).")
+        quantization_group.add_argument("--kv-quant-config", type=str, default=None,
+                        help="JSON path specifying per-layer {K,V} bits and granularity.")
+        quantization_group.add_argument("--kv-quant-validate", action="store_true",
+                        help="Validate bitwidth/shape alignment at startup; fallback to 8bit on failure.")
+        quantization_group.add_argument("--kv-quant-fused-attn", action="store_true",
+                        help="(Experimental) Use fused dequant+attention when available.")
+        quantization_group.add_argument("--kv-quant-log-path", type=str, default=None,
+                        help="If set, write kv-quant metrics as JSONL to this file.")
+        quantization_group.add_argument("--kv-quant-log-interval", type=int, default=128,
+                        help="Token interval for per-layer KV metrics logging.")
 
         return parser
 

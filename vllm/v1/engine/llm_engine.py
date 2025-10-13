@@ -34,6 +34,10 @@ from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm.v1.engine.config import KVQuantConfig
+from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger, KVQuantLayerRecord
+from vllm.v1.attention.kv_cache_quant import PagedKVCacheQuantized
+
 import time as _time, uuid as _uuid, os as _os
 
 # --- KV instrumentation (request-scoped, unified) ---
@@ -133,6 +137,50 @@ class LLMEngine:
         if not multiprocess_mode:
             # for v0 compatibility
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
+
+        # --- [KVQ] wire up a quantized-KV handle into model_executor ---
+        try:
+            kvq_cfg = KVQuantConfig.from_args(vllm_config.engine_config.engine_args)
+            self.kv_quant_cfg = kvq_cfg
+            if kvq_cfg.enable:
+                n_layers = getattr(self.model_executor, "num_hidden_layers", None)
+                if n_layers is None:
+                    n_layers = 32
+
+                # Device helper (cuda)
+                self.kv_quant = PagedKVCacheQuantized(
+                    n_layers=n_layers,
+                    policies=self.kv_quant_cfg.policy_for,
+                    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                )
+                setattr(self.model_executor, "kv_quant", self.kv_quant)
+                setattr(self.model_executor, "kv_quant_cfg", self.kv_quant_cfg)
+
+                # Lightning Attention
+                try:
+                    import vllm.model_executor.layers.lightning_attn as LA
+                    LA.lightning_attention._kvq_append = (
+                        lambda layer_idx, k, v: self.kv_quant.append_kv(layer_idx, k, v)
+                    )
+                    LA.lightning_attention._kvq_layer_idx = 0
+                except Exception:
+                    pass
+
+                # # (옵션) MLA 레이어에 직접 핸들 꽂기
+                # try:
+                #     from vllm.model_executor.layers.mla import MultiHeadLatentAttention
+                #     root = getattr(self.model_executor, "model", None)
+                #     if root is not None:
+                #         li = 0
+                #         for mod in root.modules():
+                #             if isinstance(mod, MultiHeadLatentAttention):
+                #                 setattr(mod, "kv_quant_handle", self.kv_quant)
+                #                 setattr(mod, "debug_layer_idx", li)
+                #                 li += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            print("[KVQ] injection skipped:", e, flush=True)
 
         # --- [KV] Wire up request-scoped metrics (env-driven enable) --------
         # === attach KV metrics collector to the actual engine core ===
@@ -585,6 +633,14 @@ class LLMEngine:
                     torch.cuda.empty_cache()
             except Exception:
                 pass
+        
+        if hasattr(self, "kv_quant") and getattr(self, "kv_quant_cfg", None) and self.kv_quant_cfg.log_path:
+            from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger
+            bs = self.kv_quant.bytes_summary()
+            KVQuantMetricsLogger(self.kv_quant_cfg.log_path, True).log_summary(
+                bs["kv_bytes_total_packed"], bs["kv_bytes_scales"]
+            )
+
 
     def _begin_new_run(self) -> None:
         """Always reset metrics and stamp a new run_id. No flags needed."""

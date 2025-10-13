@@ -146,6 +146,16 @@ class MultiHeadLatentAttention(CustomOp):
         q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
             positions, q[..., self.qk_nope_head_dim:], k_pe)
 
+        # ======================= [KVQ] MLA append =======================
+        if hasattr(self, "kv_quant_handle"):
+            Kc  = kv_c_normed.view(-1, 1, self.kv_lora_rank)
+            Kpe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+
+            V   = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.v_head_dim)
+            K   = torch.cat([Kc.repeat(1, self.num_heads, 1),
+                             Kpe.repeat(1, self.num_heads, 1)], dim=-1)
+            self.kv_quant_handle.append_kv(self.debug_layer_idx, K, V)
+            
         attn_out = self.mla_attn(
             q,
             kv_c_normed,

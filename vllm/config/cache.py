@@ -22,7 +22,8 @@ else:
 logger = init_logger(__name__)
 
 BlockSize = Literal[1, 8, 16, 32, 64, 128]
-CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2", "fp8_inc"]
+CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2", "fp8_inc",
+                     "kvtuner"]
 MambaDType = Literal["auto", "float32"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]
 
@@ -171,6 +172,10 @@ class CacheConfig:
         if self.cache_dtype == "auto":
             pass
         elif self.cache_dtype in get_args(CacheDType):
+            if self.cache_dtype == "kvtuner":
+                logger.info(
+                    "Using KVTuner mixed-precision KV cache scheduling.")
+                return
             logger.info(
                 "Using fp8 data type to store kv cache. It reduces the GPU "
                 "memory footprint and boosts the performance. "

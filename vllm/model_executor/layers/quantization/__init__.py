@@ -12,6 +12,7 @@ QuantizationMethods = Literal[
     "tpu_int8",
     "fp8",
     "ptpc_fp8",
+    "kvtuner",
     "fbgemm_fp8",
     "modelopt",
     "modelopt_fp4",
@@ -108,6 +109,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import Mxfp4Config
     from .petit import PetitNvFp4Config
+    from .kvtuner import KVTunerConfig
     from .ptpc_fp8 import PTPCFp8Config
     from .rtn import RTNConfig
     from .torchao import TorchAOConfig
@@ -142,6 +144,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
         "petit_nvfp4": PetitNvFp4Config,
+        "kvtuner": KVTunerConfig,
     }
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)

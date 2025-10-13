@@ -25,14 +25,15 @@ class AITERPagedAttention(PagedAttention):
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
     ) -> None:
-        if kv_cache_dtype not in ["int8", "fp8", "fp8_e4m3"]:
+        if kv_cache_dtype not in ["int8", "fp8", "fp8_e4m3", "kvtuner"]:
             PagedAttention.write_to_paged_cache(key, value, key_cache,
                                                 value_cache, slot_mapping,
                                                 kv_cache_dtype, k_scale,
                                                 v_scale)
         else:
-            kv_cache_torch_dtype = (FP8_DTYPE
-                                    if "fp8" in kv_cache_dtype else torch.int8)
+            kv_cache_torch_dtype = (FP8_DTYPE if ("fp8" in kv_cache_dtype
+                                                  or kv_cache_dtype ==
+                                                  "kvtuner") else torch.int8)
             key_cache = key_cache.view(kv_cache_torch_dtype)
             value_cache = value_cache.view(kv_cache_torch_dtype)
 
@@ -60,7 +61,7 @@ class AITERPagedAttention(PagedAttention):
         blocksparse_block_size: int = 64,
         blocksparse_head_sliding_step: int = 0,
     ) -> torch.Tensor:
-        if kv_cache_dtype not in ["int8", "fp8", "fp8_e4m3"]:
+        if kv_cache_dtype not in ["int8", "fp8", "fp8_e4m3", "kvtuner"]:
             return PagedAttention.forward_decode(
                 query=query,
                 key_cache=key_cache,

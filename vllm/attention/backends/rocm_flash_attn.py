@@ -729,7 +729,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
                     use_fp8_scales = (layer._q_scale and layer._k_scale
                                       and layer._v_scale and layer._prob_scale
-                                      and (self.kv_cache_dtype == "fp8"
+                                      and ((self.kv_cache_dtype in
+                                            ("fp8", "kvtuner"))
                                            or self.force_fp8_attention))
 
                     full_scales = (

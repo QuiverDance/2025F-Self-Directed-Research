@@ -764,11 +764,11 @@ def context_attention_fwd(q,
 
     # Conversion of FP8 Tensor from uint8 storage to
     # appropriate torch.dtype for interpretation by Triton
-    if "fp8" in kv_cache_dtype:
+    if "fp8" in kv_cache_dtype or kv_cache_dtype == "kvtuner":
         assert k_cache.dtype in [torch.uint8, current_platform.fp8_dtype()]
         assert v_cache.dtype in [torch.uint8, current_platform.fp8_dtype()]
 
-        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        if kv_cache_dtype in ("fp8", "fp8_e4m3", "kvtuner"):
             target_dtype = current_platform.fp8_dtype()
         elif kv_cache_dtype == "fp8_e5m2":
             target_dtype = torch.float8_e5m2

@@ -204,16 +204,12 @@ class KVMetricsCollector:
             cls._instance = None
 
         inst = cls._get_or_create_singleton()
-        # hard reset of aggregate counters
-        inst._num_requests = 0
-        inst.total_context = 0
-        inst.total_generated = 0
-        inst.total_prefill_ms = 0.0
-        inst.total_decode_ms = 0.0
-        inst.ttft_list = []
-        inst.peak_kv_total = 0
-        if hasattr(inst, "_req_stats"):
-            inst._req_stats = []
+        try:
+            agg = getattr(inst, "_agg", None) or getattr(inst, "aggregator", None)
+            if agg is not None and hasattr(agg, "reset"):
+                agg.reset()
+        except Exception:
+            pass
 
     @classmethod
     def get(cls, config: Optional[KVMetricsConfig] = None) -> "KVMetricsCollector":
@@ -260,7 +256,6 @@ class KVMetricsCollector:
         self._lock = threading.Lock()
         # Track inflight requests so we can write summary immediately when all finish.
         self._inflight: set[str] = set()
-        self._req_stats = []
 
         self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
         # register atexit once per process
@@ -447,31 +442,6 @@ class KVMetricsCollector:
                         if hv is not None:
                             payload[k + "_human"] = hv
 
-                try:
-                    ct = (payload.get("context_tokens")
-                        or payload.get("num_prompt_tokens")
-                        or payload.get("input_tokens"))
-                    gt = (payload.get("generated_tokens")
-                        or payload.get("num_generated_tokens")
-                        or payload.get("output_tokens"))
-                    pre_ms = payload.get("prefill_ms")
-                    dec_ms = payload.get("decode_ms")
-                    ttft = (payload.get("ttft_ms")
-                            or payload.get("time_to_first_token_ms"))
-                    kv_peak = (payload.get("kv_bytes_peak_total")
-                            or payload.get("kv_bytes_total_peak")
-                            or payload.get("kv_bytes_gpu_peak_total"))
-                    self._req_stats.append({
-                        "context_tokens": int(ct) if ct is not None else None,
-                        "generated_tokens": int(gt) if gt is not None else None,
-                        "prefill_ms": float(pre_ms) if pre_ms is not None else None,
-                        "decode_ms": float(dec_ms) if dec_ms is not None else None,
-                        "ttft_ms": float(ttft) if ttft is not None else None,
-                        "kv_peak_bytes": int(kv_peak) if kv_peak is not None else None,
-                    })
-                except Exception:
-                    pass
-
                 print("KV metrics.on_stream_end writing", payload)
                 self._writer.write(payload)
 
@@ -546,6 +516,7 @@ class KVMetricsCollector:
 
 class _RunAggregator:
     """Lightweight in-process aggregator for summary.json."""
+    
     def __init__(self):
         self.total_context = 0
         self.total_prefill_ms = 0.0
@@ -555,6 +526,17 @@ class _RunAggregator:
         self.peak_kv_total = 0
         # optional counts
         self._num_requests = 0
+        self._req_stats = []
+
+    def reset(self) -> None:
+        self.total_context = 0
+        self.total_prefill_ms = 0.0
+        self.total_generated = 0
+        self.total_decode_ms = 0.0
+        self.ttft_list = []
+        self.peak_kv_total = 0
+        self._num_requests = 0
+        self._req_stats = []
 
     def observe_request(self, rec: "RequestLog"):
         self._num_requests += 1
@@ -570,6 +552,15 @@ class _RunAggregator:
         peak = int(getattr(rec, "kv_bytes_total_peak_alloc", 0) or 0)
         if peak > self.peak_kv_total:
             self.peak_kv_total = peak
+
+        self._req_stats.append({
+            "context_tokens": int(rec.context_len or 0),
+            "generated_tokens": int(rec.generated_len or 0),
+            "prefill_ms": float(rec.prefill_ms) if rec.prefill_ms is not None else None,
+            "decode_ms": float(rec.decode_ms) if rec.decode_ms is not None else None,
+            "ttft_ms": float(rec.ttft_ms) if rec.ttft_ms is not None else None,
+            "kv_peak_bytes": peak,
+        })
 
     def build_summary(self) -> dict:
 

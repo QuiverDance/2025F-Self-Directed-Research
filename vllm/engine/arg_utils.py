@@ -467,9 +467,13 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
-    # for instrumentation
-    kv_metrics: str = None
-    kv_metrics_path: str = None
+    # ====== KV Cache Quantization (KVTuner-style) ======
+    kv_quant_enable: bool = False
+    kv_quant_config: Optional[str] = None
+    kv_quant_validate: bool = False
+    kv_quant_fused_attn: bool = False
+    kv_quant_log_path: Optional[str] = None
+    kv_quant_log_interval: int = 128
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`

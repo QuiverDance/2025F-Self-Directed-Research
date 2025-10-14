@@ -271,6 +271,7 @@ class LLMEngine:
         try:
             # ======================= [KVQ INJECT] START =======================
             kvq_cfg = KVQuantConfig.from_args(engine_args)
+            print("[KVQ] KVQuantConfig:", kvq_cfg, flush=True)
             if getattr(kvq_cfg, "enable", False):
                 me = getattr(engine, "model_executor", None)
                 if me is None:

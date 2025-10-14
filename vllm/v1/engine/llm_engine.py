@@ -285,6 +285,8 @@ class LLMEngine:
                     policies=kvq_cfg.policy_for,
                     device=Device.get_device(),
                 )
+                engine.kv_quant_cfg = kvq_cfg
+                
                 setattr(me, "kv_quant", engine.kv_quant)
                 setattr(me, "kv_quant_cfg", kvq_cfg)
 

@@ -138,50 +138,6 @@ class LLMEngine:
             # for v0 compatibility
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
 
-        # --- [KVQ] wire up a quantized-KV handle into model_executor ---
-        try:
-            kvq_cfg = KVQuantConfig.from_args(vllm_config.engine_config.engine_args)
-            self.kv_quant_cfg = kvq_cfg
-            if kvq_cfg.enable:
-                n_layers = getattr(self.model_executor, "num_hidden_layers", None)
-                if n_layers is None:
-                    n_layers = 32
-
-                # Device helper (cuda)
-                self.kv_quant = PagedKVCacheQuantized(
-                    n_layers=n_layers,
-                    policies=self.kv_quant_cfg.policy_for,
-                    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                )
-                setattr(self.model_executor, "kv_quant", self.kv_quant)
-                setattr(self.model_executor, "kv_quant_cfg", self.kv_quant_cfg)
-
-                # Lightning Attention
-                try:
-                    import vllm.model_executor.layers.lightning_attn as LA
-                    LA.lightning_attention._kvq_append = (
-                        lambda layer_idx, k, v: self.kv_quant.append_kv(layer_idx, k, v)
-                    )
-                    LA.lightning_attention._kvq_layer_idx = 0
-                except Exception:
-                    pass
-
-                # # (옵션) MLA 레이어에 직접 핸들 꽂기
-                # try:
-                #     from vllm.model_executor.layers.mla import MultiHeadLatentAttention
-                #     root = getattr(self.model_executor, "model", None)
-                #     if root is not None:
-                #         li = 0
-                #         for mod in root.modules():
-                #             if isinstance(mod, MultiHeadLatentAttention):
-                #                 setattr(mod, "kv_quant_handle", self.kv_quant)
-                #                 setattr(mod, "debug_layer_idx", li)
-                #                 li += 1
-                except Exception:
-                    pass
-        except Exception as e:
-            print("[KVQ] injection skipped:", e, flush=True)
-
         # --- [KV] Wire up request-scoped metrics (env-driven enable) --------
         # === attach KV metrics collector to the actual engine core ===
         try:
@@ -304,13 +260,48 @@ class LLMEngine:
             logger.debug("Enabling multiprocessing for LLMEngine.")
             enable_multiprocessing = True
 
-        # Create the LLMEngine.
-        return cls(vllm_config=vllm_config,
-                   executor_class=executor_class,
-                   log_stats=not engine_args.disable_log_stats,
-                   usage_context=usage_context,
-                   stat_loggers=stat_loggers,
-                   multiprocess_mode=enable_multiprocessing)
+        # build engine instance first
+        engine = cls(vllm_config=vllm_config,
+                 executor_class=executor_class,
+                 log_stats=not engine_args.disable_log_stats,
+                 usage_context=usage_context,
+                 stat_loggers=stat_loggers,
+                 multiprocess_mode=enable_multiprocessing)
+
+        try:
+            # ======================= [KVQ INJECT] START =======================
+            kvq_cfg = KVQuantConfig.from_args(engine_args)
+            if getattr(kvq_cfg, "enable", False):
+                me = getattr(engine, "model_executor", None)
+                if me is None:
+                    logger.warning("[KVQ] model_executor not available (multiprocess mode?); skipping KVQ injection.")
+                    return engine
+
+                n_layers = getattr(me, "num_hidden_layers", None) or \
+                        getattr(engine, "num_hidden_layers", None) or 32
+
+                engine.kv_quant = PagedKVCacheQuantized(
+                    n_layers=n_layers,
+                    policies=kvq_cfg.policy_for,
+                    device=Device.get_device(),
+                )
+                setattr(me, "kv_quant", engine.kv_quant)
+                setattr(me, "kv_quant_cfg", kvq_cfg)
+
+                try:
+                    import vllm.model_executor.layers.lightning_attn as LA
+                    LA.lightning_attention._kvq_append = \
+                        (lambda li, k, v: engine.kv_quant.append_kv(li, k, v))
+                    LA.lightning_attention._kvq_layer_idx = 0
+                    logger.info("[KVQ] injected into lightning_attn.")
+                except Exception as _hook_e:
+                    logger.warning(f"[KVQ] lightning hook failed: {_hook_e}")
+            else:
+                engine.kv_quant = None
+        except Exception as e:
+            logger.warning(f"[KVQ] injection failed: {e}")
+
+    return engine
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()

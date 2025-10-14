@@ -301,7 +301,7 @@ class LLMEngine:
         except Exception as e:
             logger.warning(f"[KVQ] injection failed: {e}")
 
-    return engine
+        return engine
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()

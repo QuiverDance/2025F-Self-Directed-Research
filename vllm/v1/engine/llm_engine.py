@@ -268,42 +268,6 @@ class LLMEngine:
                  stat_loggers=stat_loggers,
                  multiprocess_mode=enable_multiprocessing)
 
-        try:
-            # ======================= [KVQ INJECT] START =======================
-            kvq_cfg = KVQuantConfig.from_args(engine_args)
-            print("[KVQ] KVQuantConfig:", kvq_cfg, flush=True)
-            if getattr(kvq_cfg, "enable", False):
-                me = getattr(engine, "model_executor", None)
-                if me is None:
-                    logger.warning("[KVQ] model_executor not available (multiprocess mode?); skipping KVQ injection.")
-                    return engine
-
-                n_layers = getattr(me, "num_hidden_layers", None) or \
-                        getattr(engine, "num_hidden_layers", None) or 32
-
-                engine.kv_quant = PagedKVCacheQuantized(
-                    n_layers=n_layers,
-                    policies=kvq_cfg.policy_for,
-                    device=Device.get_device(),
-                )
-                engine.kv_quant_cfg = kvq_cfg
-
-                setattr(me, "kv_quant", engine.kv_quant)
-                setattr(me, "kv_quant_cfg", kvq_cfg)
-
-                try:
-                    import vllm.model_executor.layers.lightning_attn as LA
-                    LA.lightning_attention._kvq_append = \
-                        (lambda li, k, v: engine.kv_quant.append_kv(li, k, v))
-                    LA.lightning_attention._kvq_layer_idx = 0
-                    logger.info("[KVQ] injected into lightning_attn.")
-                except Exception as _hook_e:
-                    logger.warning(f"[KVQ] lightning hook failed: {_hook_e}")
-            else:
-                engine.kv_quant = None
-        except Exception as e:
-            logger.warning(f"[KVQ] injection failed: {e}")
-
         return engine
 
     def get_num_unfinished_requests(self) -> int:

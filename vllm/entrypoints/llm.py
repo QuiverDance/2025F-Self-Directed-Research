@@ -287,6 +287,45 @@ class LLM:
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.engine_class = type(self.llm_engine)
 
+        # ======================= [KVQ] universal injection =======================
+        try:
+            from vllm.v1.engine.config import KVQuantConfig
+            kvq_cfg = KVQuantConfig.from_args(engine_args)
+            print("[KVQ] KVQuantConfig:", kvq_cfg, flush=True)
+            setattr(self.llm_engine, "kv_quant_cfg", kvq_cfg)
+
+            if getattr(kvq_cfg, "enable", False):
+                from vllm.v1.attention.kv_cache_quant import PagedKVCacheQuantized
+                from vllm.utils import Device
+                me = getattr(self.llm_engine, "model_executor", None)
+                if me is not None:
+                    n_layers = getattr(me, "num_hidden_layers", None) or getattr(self.llm_engine, "num_hidden_layers", None) or 32
+                    kvq = PagedKVCacheQuantized(
+                        n_layers=n_layers,
+                        policies=kvq_cfg.policy_for,
+                        device=Device.get_device(),
+                    )
+                    setattr(self.llm_engine, "kv_quant", kvq)
+                    setattr(me, "kv_quant", kvq)
+                    setattr(me, "kv_quant_cfg", kvq_cfg)
+
+                    try:
+                        import vllm.model_executor.layers.lightning_attn as LA
+                        LA.lightning_attention._kvq_append = (lambda li, k, v: kvq.append_kv(li, k, v))
+                        LA.lightning_attention._kvq_layer_idx = 0
+                        print("[KVQ] injected into lightning_attn.", flush=True)
+                    except Exception as _e:
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(f"[KVQ] lightning hook failed: {_e}")
+                else:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning("[KVQ] model_executor not available; skip handle attach.")
+            self.kv_quant = getattr(self.llm_engine, "kv_quant", None)
+            self.kv_quant_cfg = getattr(self.llm_engine, "kv_quant_cfg", None)
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(f"[KVQ] injection at LLM failed: {e}")
+
         self.request_counter = Counter()
         self.default_sampling_params: Union[dict[str, Any], None] = None
 

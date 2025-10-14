@@ -286,7 +286,7 @@ class LLMEngine:
                     device=Device.get_device(),
                 )
                 engine.kv_quant_cfg = kvq_cfg
-                
+
                 setattr(me, "kv_quant", engine.kv_quant)
                 setattr(me, "kv_quant_cfg", kvq_cfg)
 
@@ -627,6 +627,8 @@ class LLMEngine:
             except Exception:
                 pass
         
+        print("[KVQ] is kv_qunat enabled?", hasattr(self, "kv_quant") and getattr(self, "kv_quant") is not None, flush=True)
+        print("[KVQ] log path:", hasattr(self, "kv_quant_cfg") and getattr(self, "kv_quant_cfg", None) and self.kv_quant_cfg.log_path, flush=True)
         if hasattr(self, "kv_quant") and getattr(self, "kv_quant_cfg", None) and self.kv_quant_cfg.log_path:
             from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger
             bs = self.kv_quant.bytes_summary()

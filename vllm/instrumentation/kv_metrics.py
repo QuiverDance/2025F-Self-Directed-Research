@@ -408,7 +408,7 @@ class KVMetricsCollector:
         self.on_first_token(request_id)
 
     def on_stream_end(self, request_id: str) -> None:
-        print("[KVCHK-WRITE] writer?", bool(self._writer), "summary?", self.cfg.summary_enabled)
+        # print("[KVCHK-WRITE] writer?", bool(self._writer), "summary?", self.cfg.summary_enabled)
         """Finalize request record, compute decode_ms/TPS, flush JSONL once."""
         if not self.cfg.enabled:
             return
@@ -861,6 +861,7 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
 
 
 def _kvdbg(tag: str, payload=None):
+    return
     if payload is None:
         print(f"[KVDBG] {tag}", flush=True)
     else:

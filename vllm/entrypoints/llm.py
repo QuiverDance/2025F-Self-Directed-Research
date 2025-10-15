@@ -293,13 +293,15 @@ class LLM:
             if getattr(kvq_cfg, "enable", False):
                 from vllm.v1.attention.kv_cache_quant import PagedKVCacheQuantized
                 from vllm.utils import Device
+                import torch
                 me = getattr(self.llm_engine, "model_executor", None)
                 if me is not None:
                     n_layers = getattr(me, "num_hidden_layers", None) or getattr(self.llm_engine, "num_hidden_layers", None) or 32
+                    dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
                     kvq = PagedKVCacheQuantized(
                         n_layers=n_layers,
                         policies=kvq_cfg.policy_for,
-                        device=Device.get_device(),
+                        device=dev,
                     )
                     setattr(self.llm_engine, "kv_quant", kvq)
                     setattr(me, "kv_quant", kvq)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 import torch
 import math
-
+from vllm.v1.metrics.kv_quant import KVQuantLayerRecord
 # -------------------------
 # Helpers for (de)quant
 # -------------------------
@@ -247,11 +247,27 @@ class PagedKVCacheQuantized:
         st.T += T
 
         # book-keep bytes
-        self.bytes_total += int(st.K_packed.element_size() * st.K_packed.numel())
-        self.bytes_total += int(st.V_packed.element_size() * st.V_packed.numel())
-        # scale bytes (half for float16 scale; here kept in float32 for stability → 4 bytes)
+        self.bytes_total += int(qk.element_size() * qk.numel())
+        self.bytes_total += int(qv.element_size() * qv.numel())
+        # scale bytes (kept in float32 for stability → 4 bytes)
         self.bytes_scales += int(sk.element_size() * sk.numel())
         self.bytes_scales += int(sv.element_size() * sv.numel())
+
+        # per-layer cumulative snapshot
+        if hasattr(self, "logger") and self.logger:
+            k_bytes = int(st.K_packed.element_size() * st.K_packed.numel()) if st.K_packed is not None else 0
+            v_bytes = int(st.V_packed.element_size() * st.V_packed.numel()) if st.V_packed is not None else 0
+            ks_bytes = int(st.K_scale.element_size() * st.K_scale.numel()) if st.K_scale is not None else 0
+            vs_bytes = int(st.V_scale.element_size() * st.V_scale.numel()) if st.V_scale is not None else 0
+            self.logger.log_layer(KVQuantLayerRecord(
+                layer=layer_idx,
+                bits_k=st.bits_k,
+                bits_v=st.bits_v,
+                kv_bytes_total_packed=k_bytes + v_bytes,
+                kv_bytes_scales=ks_bytes + vs_bytes,
+                tt=0.0,
+            ))
+
 
     def dequant_slice(self, layer_idx: int, t_slice: slice) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return fp16 K,V for given time slice [start:stop]. Shapes [T,H,D]."""

@@ -307,14 +307,23 @@ class LLM:
                     setattr(me, "kv_quant", kvq)
                     setattr(me, "kv_quant_cfg", kvq_cfg)
 
-                    try:
+                     try:
                         import vllm.model_executor.layers.lightning_attn as LA
                         LA.lightning_attention._kvq_append = (lambda li, k, v: kvq.append_kv(li, k, v))
-                        LA.lightning_attention._kvq_layer_idx = 0
+                        LA.lightning_attention._kvq_layer_idx = -1
+                        LA.lightning_attention._kvq_debug = bool(getattr(kvq_cfg, "validate", False))
                         print("[KVQ] injected into lightning_attn.", flush=True)
                     except Exception as _e:
                         import logging as _logging
                         _logging.getLogger(__name__).warning(f"[KVQ] lightning hook failed: {_e}")
+
+                    try:
+                        from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger
+                        if getattr(kvq_cfg, "log_path", None):
+                            kvq.logger = KVQuantMetricsLogger(kvq_cfg.log_path, True)
+                    except Exception as _e:
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(f"[KVQ] logger attach failed: {_e}")
                 else:
                     import logging as _logging
                     _logging.getLogger(__name__).warning("[KVQ] model_executor not available; skip handle attach.")

@@ -490,15 +490,28 @@ def lightning_attention(
             k_step = k.permute(0, 2, 1, 3).contiguous().reshape(T, H_kv, Dk)
             v_step = v.permute(0, 2, 1, 3).contiguous().reshape(T, H_kv, Dv)
 
-            layer_idx = getattr(lightning_attention, "_kvq_layer_idx", 0)
-            lightning_attention._kvq_append(layer_idx, k_step, v_step)
+            # --------------------- [KVQ] layer index auto-infer ---------------------
+            li = getattr(lightning_attention, "_kvq_layer_idx", None)
+            if li is None or li == -1:
+                # Use 'ed' tensor identity as a stable per-layer key
+                try:
+                    key = int(ed.untyped_storage().data_ptr())  # PyTorch >=1.13
+                except Exception:
+                    key = id(ed)  # fallback
+                if not hasattr(lightning_attention, "_kvq_layer_map"):
+                    lightning_attention._kvq_layer_map = {}
+                    lightning_attention._kvq_next_layer = 0
+                if key not in lightning_attention._kvq_layer_map:
+                    lightning_attention._kvq_layer_map[key] = lightning_attention._kvq_next_layer
+                    lightning_attention._kvq_next_layer += 1
+                li = lightning_attention._kvq_layer_map[key]
+            # -----------------------------------------------------------------------
+
+            lightning_attention._kvq_append(li, k_step, v_step)
 
             if getattr(lightning_attention, "_kvq_debug", False) and not getattr(lightning_attention, "_kvq_once", False):
-                print(f"[KVQ] append active: T={T}, H_kv={H_kv}, Dk={Dk}, Dv={Dv}", flush=True)
-                lightning_attention._kvq_once = True
-        except Exception as e:
-            print(f"[KVQ] append failed: {type(e).__name__}: {e}", flush=True)
-    
+                print(f"[KVQ] append active: layer={li}, T={T}, H_kv={H_kv}, Dk={Dk}, Dv={Dv}", flush=True)
+
     d = q.shape[-1]
     e = v.shape[-1]
 
@@ -641,6 +654,20 @@ def linear_decode_forward_triton(
     B, H, _, D = q.shape
     assert k.shape == (B, H, 1, D)
     assert v.shape == (B, H, 1, D)
+
+    # ======================= [KVQ][decode] =======================
+    if hasattr(lightning_attention, "_kvq_append"):
+        try:
+            li = getattr(lightning_attention, "_kvq_layer_idx", 0)
+            # k, v: [B, H, 1, D] -> [1, H, D]
+            k_step = rearrange(k, "b h 1 d -> 1 h d").contiguous()
+            v_step = rearrange(v, "b h 1 d -> 1 h d").contiguous()
+            lightning_attention._kvq_append(li, k_step, v_step)
+            if getattr(lightning_attention, "_kvq_debug", False):
+                print(f"[KVQ][decode] layer={li} H={k_step.shape[1]} D={k_step.shape[2]}", flush=True)
+        except Exception as _e:
+            if getattr(lightning_attention, "_kvq_debug", False):
+                print(f"[KVQ][decode] append failed: {type(_e).__name__}: {_e}", flush=True)
 
     # Initialize output tensor
     output = torch.empty_like(q)

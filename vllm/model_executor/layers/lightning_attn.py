@@ -483,14 +483,21 @@ def lightning_attention(
     # ======================= [KVQ] =======================
     if hasattr(lightning_attention, "_kvq_append"):
         try:
-            # k: [B, H_kv, N, Dk] -> [N, H_kv, Dk]  (T=N)
-            # v: [B, H_kv, N, Dv] -> [N, H_kv, Dv]
-            k_step = rearrange(k, "b h n d -> n h d")
-            v_step = rearrange(v, "b h n d -> n h d")
+            # k, v: [B, H_kv, N, D]  →  [T=B*N, H_kv, D]
+            B, H_kv, N, Dk = k.shape
+            Dv = v.shape[-1]
+            T = B * N
+            k_step = k.permute(0, 2, 1, 3).contiguous().reshape(T, H_kv, Dk)
+            v_step = v.permute(0, 2, 1, 3).contiguous().reshape(T, H_kv, Dv)
+
             layer_idx = getattr(lightning_attention, "_kvq_layer_idx", 0)
             lightning_attention._kvq_append(layer_idx, k_step, v_step)
-        except Exception:
-            pass
+
+            if getattr(lightning_attention, "_kvq_debug", False) and not getattr(lightning_attention, "_kvq_once", False):
+                print(f"[KVQ] append active: T={T}, H_kv={H_kv}, Dk={Dk}, Dv={Dv}", flush=True)
+                lightning_attention._kvq_once = True
+        except Exception as e:
+            print(f"[KVQ] append failed: {type(e).__name__}: {e}", flush=True)
     
     d = q.shape[-1]
     e = v.shape[-1]

@@ -591,15 +591,6 @@ class LLMEngine:
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-        
-        print("[KVQ] is kv_qunat enabled?", hasattr(self, "kv_quant") and getattr(self, "kv_quant") is not None, flush=True)
-        print("[KVQ] log path:", hasattr(self, "kv_quant_cfg") and getattr(self, "kv_quant_cfg", None) and self.kv_quant_cfg.log_path, flush=True)
-        if hasattr(self, "kv_quant") and getattr(self, "kv_quant_cfg", None) and self.kv_quant_cfg.log_path:
-            from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger
-            bs = self.kv_quant.bytes_summary()
-            KVQuantMetricsLogger(self.kv_quant_cfg.log_path, True).log_summary(
-                bs["kv_bytes_total_packed"], bs["kv_bytes_scales"]
-            )
 
 
     def _begin_new_run(self) -> None:

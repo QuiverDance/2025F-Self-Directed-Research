@@ -349,17 +349,30 @@ class KVMetricsCollector:
             except Exception:
                 pass
 
+            key_packed = f"kv_bytes_total_packed_at_{phase}"
+            qpacked = 0
+            try:
+                eng = getattr(self, "_engine_ref", None)
+                kvq = getattr(eng, "kv_quant", None) if eng is not None else None
+                if kvq is not None and hasattr(kvq, "bytes_summary"):
+                    bs = kvq.bytes_summary()  # {"kv_bytes_total_packed": ..., "kv_bytes_scales": ...}
+                    qpacked = int(bs.get("kv_bytes_total_packed", 0) or 0)
+            except Exception:
+                qpacked = 0
+
             # Write into the record (dict-first; fallback to attribute if not a dict)
             if isinstance(rec, dict):
                 rec[key_total] = total
                 rec[key_gpu]   = gpu
                 rec[key_cpu]   = cpu
                 rec[f"kv_token_bytes_est_at_{phase}"] = int(est_token_bytes)
+                rec[key_packed] = qpacked
             else:
                 setattr(rec, key_total, total)
                 setattr(rec, key_gpu,   gpu)
                 setattr(rec, key_cpu,   cpu)
                 setattr(rec, f"kv_token_bytes_est_at_{phase}", int(est_token_bytes))
+                setattr(rec, key_packed, qpacked)
 
             # Maintain peak for summary
             try:

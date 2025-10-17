@@ -256,6 +256,9 @@ class KVMetricsCollector:
         self._lock = threading.Lock()
         # Track inflight requests so we can write summary immediately when all finish.
         self._inflight: set[str] = set()
+        # per-request baseline of engine-global KV usage (bytes)
+        # format: {request_id: {"total": int, "gpu": int, "cpu": int}}
+        self._baseline: Dict[str, Dict[str, int]] = {}
 
         self._agg = _RunAggregator() if (self.cfg.enabled and self.cfg.summary_enabled) else None
         # register atexit once per process
@@ -316,9 +319,14 @@ class KVMetricsCollector:
             return
 
         snap = self._kv_bytes_snapshot()
-        total = int(snap.get("total", 0))
-        gpu   = int(snap.get("gpu", 0))
-        cpu   = int(snap.get("cpu", 0))
+        cur_total = int(snap.get("total", 0))
+        cur_gpu   = int(snap.get("gpu",   0))
+        cur_cpu   = int(snap.get("cpu",   0))
+        base = self._baseline.get(request_id, {"total": 0, "gpu": 0, "cpu": 0})
+        # per-request incremental usage (clamped >= 0)
+        total = max(0, cur_total - int(base.get("total", 0)))
+        gpu   = max(0, cur_gpu   - int(base.get("gpu",   0)))
+        cpu   = max(0, cur_cpu   - int(base.get("cpu",   0)))
 
         key_total = f"kv_bytes_total_at_{phase}"
         key_gpu   = f"kv_bytes_gpu_at_{phase}"
@@ -385,6 +393,17 @@ class KVMetricsCollector:
                             base[k] = meta[k]
                 self._req[request_id] = RequestLog(**base)
             self._t_start[request_id] = now
+            # capture engine-global KV usage as baseline for this request
+            try:
+                snap0 = self._kv_bytes_snapshot()  # {"total","gpu","cpu"}
+                self._baseline[request_id] = {
+                    "total": int(snap0.get("total", 0) or 0),
+                    "gpu":   int(snap0.get("gpu",   0) or 0),
+                    "cpu":   int(snap0.get("cpu",   0) or 0),
+                }
+            except Exception:
+                print("[KVCHK] baseline snapshot failed for", request_id)
+                self._baseline[request_id] = {"total": 0, "gpu": 0, "cpu": 0}
             self._inflight.add(request_id)
     
     def on_first_token(self, request_id: str) -> None:
@@ -446,6 +465,11 @@ class KVMetricsCollector:
                 self._writer.write(payload)
 
             self._finished.add(request_id)
+            # drop baseline after finishing this request
+            try:
+                self._baseline.pop(request_id, None)
+            except Exception:
+                pass
             self._inflight.discard(request_id)
             # If no more inflight, write summary right now (no need to wait for atexit).
             if self._agg is not None and self.cfg.summary_enabled and not self._inflight:
@@ -472,10 +496,15 @@ class KVMetricsCollector:
         """Update per-request peak of block-based allocated bytes (GPU/CPU/Total)."""
         if not self.cfg.enabled:
             return
-        snap = self._kv_bytes_snapshot()  # {"total":..., "gpu":..., "cpu":...}
-        total = int(snap.get("total", 0))
-        gpu   = int(snap.get("gpu", 0))
-        cpu   = int(snap.get("cpu", 0))
+        snap = self._kv_bytes_snapshot()
+        cur_total = int(snap.get("total", 0))
+        cur_gpu   = int(snap.get("gpu",   0))
+        cur_cpu   = int(snap.get("cpu",   0))
+        base = self._baseline.get(str(request_id), {"total": 0, "gpu": 0, "cpu": 0})
+        total = max(0, cur_total - int(base.get("total", 0)))
+        gpu   = max(0, cur_gpu   - int(base.get("gpu",   0)))
+        cpu   = max(0, cur_cpu   - int(base.get("cpu",   0)))
+
         with self._lock:
             rec = self._req.get(str(request_id))
             if rec is None:

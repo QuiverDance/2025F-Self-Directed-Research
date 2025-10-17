@@ -355,11 +355,13 @@ class KVMetricsCollector:
             key_packed = f"kv_bytes_total_packed_at_{phase}"
             qpacked = 0
             try:
-                kvq = getattr(self._engine_ref, "kv_quant", None) if eng is not None else None
+                kvq = getattr(self._engine_ref, "kv_quant", None)
                 if kvq is not None and hasattr(kvq, "bytes_summary"):
+                    print("[KVCHK] snapshot_kv: getting qpacked for", request_id)
                     bs = kvq.bytes_summary()  # {"kv_bytes_total_packed": ..., "kv_bytes_scales": ...}
                     qpacked = int(bs.get("kv_bytes_total_packed", 0) or 0)
             except Exception:
+                print("[KVCHK] snapshot_kv: failed to get qpacked for", request_id)
                 qpacked = 0
 
             # Write into the record (dict-first; fallback to attribute if not a dict)
@@ -691,6 +693,10 @@ class _RunAggregator:
 
             "avg_kv_peak_bytes_per_req": _mean(kvp_list),
             "max_kv_peak_bytes_per_req": (max(kvp_list) if kvp_list else None),
+
+            "peak_kv_bytes_total_packed": self.peak_kv_total_packed,
+            "avg_kv_packed_bytes_at_decode_per_req": _mean(kvpd_list),
+            "max_kv_packed_bytes_at_decode_per_req": (max(kvpd_list) if kvpd_list else None),
         }
 
         for _k in (

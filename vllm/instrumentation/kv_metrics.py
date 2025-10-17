@@ -72,6 +72,9 @@ class RequestLog:
     kv_bytes_gpu_at_decode: Optional[int] = None
     kv_bytes_cpu_at_decode: Optional[int] = None
 
+    kv_bytes_total_packed_at_prefill: Optional[int] = None
+    kv_bytes_total_packed_at_decode: Optional[int] = None
+
     # Token-based KV size (for transparency; not used for scheduling)
     kv_token_bytes_est_at_prefill: Optional[int] = None
     kv_token_bytes_est_at_decode: Optional[int] = None
@@ -352,8 +355,7 @@ class KVMetricsCollector:
             key_packed = f"kv_bytes_total_packed_at_{phase}"
             qpacked = 0
             try:
-                eng = getattr(self, "_engine_ref", None)
-                kvq = getattr(eng, "kv_quant", None) if eng is not None else None
+                kvq = getattr(self._engine_ref, "kv_quant", None) if eng is not None else None
                 if kvq is not None and hasattr(kvq, "bytes_summary"):
                     bs = kvq.bytes_summary()  # {"kv_bytes_total_packed": ..., "kv_bytes_scales": ...}
                     qpacked = int(bs.get("kv_bytes_total_packed", 0) or 0)
@@ -386,6 +388,8 @@ class KVMetricsCollector:
                 "rid": request_id, "phase": phase,
                 key_total: total, key_gpu: gpu, key_cpu: cpu,
                 f"kv_token_bytes_est_at_{phase}": int(est_token_bytes),
+                f"kv_token_bytes_est_at_{phase}": int(est_token_bytes),
+                key_packed: qpacked,
             })
 
     
@@ -566,6 +570,7 @@ class _RunAggregator:
         self.total_decode_ms = 0.0
         self.ttft_list = []  # for p50/p90
         self.peak_kv_total = 0
+        self.peak_kv_total_packed = 0  # (NEW)
         # optional counts
         self._num_requests = 0
         self._req_stats = []
@@ -594,6 +599,9 @@ class _RunAggregator:
         peak = int(getattr(rec, "kv_bytes_total_peak_alloc", 0) or 0)
         if peak > self.peak_kv_total:
             self.peak_kv_total = peak
+        qpacked = int(getattr(rec, "kv_bytes_total_packed_at_decode", 0) or 0)
+        if qpacked > self.peak_kv_total_packed:
+            self.peak_kv_total_packed = qpacked
 
         self._req_stats.append({
             "context_tokens": int(rec.context_len or 0),
@@ -602,6 +610,7 @@ class _RunAggregator:
             "decode_ms": float(rec.decode_ms) if rec.decode_ms is not None else None,
             "ttft_ms": float(rec.ttft_ms) if rec.ttft_ms is not None else None,
             "kv_peak_bytes": peak,
+            "kv_packed_decode_bytes": qpacked,
         })
 
     def build_summary(self) -> dict:
@@ -644,6 +653,7 @@ class _RunAggregator:
         ctx_list = _valid([r.get("context_tokens") for r in reqs])
         gen_list = _valid([r.get("generated_tokens") for r in reqs])
         kvp_list = _valid([r.get("kv_peak_bytes") for r in reqs])
+        kvpd_list = _valid([r.get("kv_packed_decode_bytes") for r in reqs])
         ttft_req = _valid([r.get("ttft_ms") for r in reqs])
 
         for r in reqs:
@@ -683,7 +693,14 @@ class _RunAggregator:
             "max_kv_peak_bytes_per_req": (max(kvp_list) if kvp_list else None),
         }
 
-        for _k in ("peak_kv_bytes_total", "avg_kv_peak_bytes_per_req", "max_kv_peak_bytes_per_req"):
+        for _k in (
+            "peak_kv_bytes_total",
+            "avg_kv_peak_bytes_per_req",
+            "max_kv_peak_bytes_per_req",
+            "peak_kv_bytes_total_packed",
+            "avg_kv_packed_bytes_at_decode_per_req",
+            "max_kv_packed_bytes_at_decode_per_req",
+        ):
             _v = out.get(_k)
             try:
                 if _v is not None:

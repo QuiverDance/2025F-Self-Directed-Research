@@ -334,6 +334,7 @@ class KVMetricsCollector:
         key_total = f"kv_bytes_total_at_{phase}"
         key_gpu   = f"kv_bytes_gpu_at_{phase}"
         key_cpu   = f"kv_bytes_cpu_at_{phase}"
+        key_packed = f"kv_bytes_total_packed_at_{phase}"
 
         with self._lock:
             rec = self._req.get(request_id)
@@ -352,18 +353,13 @@ class KVMetricsCollector:
             except Exception:
                 pass
 
-            key_packed = f"kv_bytes_total_packed_at_{phase}"
             qpacked = 0
             try:
-                eng = getattr(self, "_engine_ref", None)
-                kvq = getattr(eng, "kv_quant", None)
-                if kvq is not None and hasattr(kvq, "bytes_summary"):
-                    print("[KVCHK] snapshot_kv: getting qpacked for", request_id)
+                kvq = _get_kvq_from_engine(getattr(self, "_engine_ref", None))
+                if kvq is not None:
                     bs = kvq.bytes_summary()  # {"kv_bytes_total_packed": ..., "kv_bytes_scales": ...}
                     qpacked = int(bs.get("kv_bytes_total_packed", 0) or 0)
-                print("[KVCHK] kvq:", kvq, "qpacked:", qpacked)
             except Exception:
-                print("[KVCHK] snapshot_kv: failed to get qpacked for", request_id)
                 qpacked = 0
 
             # Write into the record (dict-first; fallback to attribute if not a dict)
@@ -564,6 +560,39 @@ class KVMetricsCollector:
         except Exception:
             pass
 
+    def _get_kvq_from_engine(engine_ref):
+        try:
+            kvq = getattr(engine_ref, "kv_quant", None)
+            if kvq is not None and hasattr(kvq, "bytes_summary"):
+                return kvq
+        except Exception:
+            pass
+
+        # llm_engine.model_executor.kv_quant
+        try:
+            me = getattr(engine_ref, "model_executor", None)
+            if me is not None:
+                kvq = getattr(me, "kv_quant", None)
+                if kvq is not None and hasattr(kvq, "bytes_summary"):
+                    return kvq
+        except Exception:
+            pass
+        # llm_engine.engine_core.kv_quant
+        try:
+            ec = getattr(engine_ref, "engine_core", None)
+            if ec is not None:
+                kvq = getattr(ec, "kv_quant", None)
+                if kvq is not None and hasattr(kvq, "bytes_summary"):
+                    return kvq
+                me2 = getattr(ec, "model_executor", None)
+                if me2 is not None:
+                    kvq = getattr(me2, "kv_quant", None)
+                    if kvq is not None and hasattr(kvq, "bytes_summary"):
+                        return kvq
+        except Exception:
+            pass
+        return None
+
 class _RunAggregator:
     """Lightweight in-process aggregator for summary.json."""
     
@@ -574,7 +603,7 @@ class _RunAggregator:
         self.total_decode_ms = 0.0
         self.ttft_list = []  # for p50/p90
         self.peak_kv_total = 0
-        self.peak_kv_total_packed = 0  # (NEW)
+        self.peak_kv_total_packed = 0
         # optional counts
         self._num_requests = 0
         self._req_stats = []

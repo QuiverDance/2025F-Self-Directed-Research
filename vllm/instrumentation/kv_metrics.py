@@ -461,7 +461,7 @@ class KVMetricsCollector:
                         if hv is not None:
                             payload[k + "_human"] = hv
 
-                print("KV metrics.on_stream_end writing", payload)
+                # print("KV metrics.on_stream_end writing", payload)
                 self._writer.write(payload)
 
             self._finished.add(request_id)

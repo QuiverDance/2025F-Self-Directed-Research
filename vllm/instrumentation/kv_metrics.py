@@ -360,6 +360,7 @@ class KVMetricsCollector:
                     print("[KVCHK] snapshot_kv: getting qpacked for", request_id)
                     bs = kvq.bytes_summary()  # {"kv_bytes_total_packed": ..., "kv_bytes_scales": ...}
                     qpacked = int(bs.get("kv_bytes_total_packed", 0) or 0)
+                print("[KVCHK] kvq:", kvq, "qpacked:", qpacked)
             except Exception:
                 print("[KVCHK] snapshot_kv: failed to get qpacked for", request_id)
                 qpacked = 0

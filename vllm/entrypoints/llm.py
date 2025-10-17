@@ -308,14 +308,24 @@ class LLM:
                     setattr(me, "kv_quant_cfg", kvq_cfg)
 
                     try:
-                        import vllm.model_executor.layers.lightning_attn as LA
-                        LA.lightning_attention._kvq_append = (lambda li, k, v: kvq.append_kv(li, k, v))
-                        LA.lightning_attention._kvq_layer_idx = -1
-                        LA.lightning_attention._kvq_debug = bool(getattr(kvq_cfg, "validate", False))
-                        print("[KVQ] injected into lightning_attn.", flush=True)
+                        import torch
+                        from vllm.v1.attention.backends.flex_attention import FlexAttentionImpl
+                        if not getattr(FlexAttentionImpl, "_kvq_wrapped", False):
+                            _orig_forward = FlexAttentionImpl.forward
+                            _li_map = {}
+                            def _wrapped_forward(self, *args, **kwargs):
+                                k_like = args[2] if len(args) > 2 and isinstance(args[2], torch.Tensor) else None
+                                v_like = args[3] if len(args) > 3 and isinstance(args[3], torch.Tensor) else None
+                                if isinstance(k_like, torch.Tensor) and isinstance(v_like, torch.Tensor):
+                                    li = _li_map.setdefault(id(self), len(_li_map))
+                                    kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
+                                return _orig_forward(self, *args, **kwargs)
+                            FlexAttentionImpl.forward = _wrapped_forward
+                            FlexAttentionImpl._kvq_wrapped = True
+                            print("[KVQ] FlexAttention integration: FlexAttentionImpl.forward wrapped.", flush=True)
                     except Exception as _e:
                         import logging as _logging
-                        _logging.getLogger(__name__).warning(f"[KVQ] lightning hook failed: {_e}")
+                        _logging.getLogger(__name__).warning(f"[KVQ] flex hook failed: {_e}")
 
                     try:
                         from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger

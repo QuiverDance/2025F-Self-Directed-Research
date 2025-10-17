@@ -243,15 +243,22 @@ class PagedKVCacheQuantized:
         st.K_packed = _cat(st.K_packed, qk)
         st.V_packed = _cat(st.V_packed, qv)
         st.K_scale = _cat(st.K_scale, sk) if st.granularity == "per_token_head" else sk
+        first_append = (st.T == 0)
         st.V_scale = _cat(st.V_scale, sv) if st.granularity == "per_token_head" else sv
         st.T += T
 
         # book-keep bytes
         self.bytes_total += int(qk.element_size() * qk.numel())
         self.bytes_total += int(qv.element_size() * qv.numel())
-        # scale bytes (kept in float32 for stability → 4 bytes)
-        self.bytes_scales += int(sk.element_size() * sk.numel())
-        self.bytes_scales += int(sv.element_size() * sv.numel())
+
+        # scales bytes        
+        if st.granularity == "per_token_head":
+            self.bytes_scales += int(sk.element_size() * sk.numel())
+            self.bytes_scales += int(sv.element_size() * sv.numel())
+        else:
+            if first_append:
+                self.bytes_scales += int(sk.element_size() * sk.numel())
+                self.bytes_scales += int(sv.element_size() * sv.numel())
 
         # per-layer cumulative snapshot
         if hasattr(self, "logger") and self.logger:

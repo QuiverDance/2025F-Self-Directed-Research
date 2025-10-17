@@ -142,15 +142,13 @@ class LLMEngine:
         # === attach KV metrics collector to the actual engine core ===
         try:
             col = KVMetricsCollector.get()   # env-based config
-            # eng_like = self.engine_core
-            # # In single-process, EngineCoreClient exposes the real EngineCore here:
-            # if hasattr(eng_like, "engine_core"):
-            #     eng_like = eng_like.engine_core
-            # col.link_engine(eng_like or self)
-            col.link_engine(self)
+            eng_like = self.engine_core
+            # In single-process, EngineCoreClient exposes the real EngineCore here:
+            if hasattr(eng_like, "engine_core"):
+                eng_like = eng_like.engine_core
+            col.link_engine(eng_like or self)
             self._kv_metrics = col
-            print("[KVDBG] linked metrics to LLMEngine", flush=True)
-            # print("[KVDBG] linked metrics to", type(eng_like).__name__, flush=True)
+            print("[KVDBG] linked metrics to", type(eng_like).__name__, flush=True)
         except Exception as e:
             print("[KVDBG] link_engine failed:", repr(e), flush=True)
 

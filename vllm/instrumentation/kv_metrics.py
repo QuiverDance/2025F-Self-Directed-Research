@@ -355,7 +355,8 @@ class KVMetricsCollector:
             key_packed = f"kv_bytes_total_packed_at_{phase}"
             qpacked = 0
             try:
-                kvq = getattr(self._engine_ref, "kv_quant", None)
+                eng = getattr(self, "_engine_ref", None)
+                kvq = getattr(eng, "kv_quant", None)
                 if kvq is not None and hasattr(kvq, "bytes_summary"):
                     print("[KVCHK] snapshot_kv: getting qpacked for", request_id)
                     bs = kvq.bytes_summary()  # {"kv_bytes_total_packed": ..., "kv_bytes_scales": ...}

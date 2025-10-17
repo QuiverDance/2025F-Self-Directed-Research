@@ -307,7 +307,7 @@ class LLM:
                     setattr(me, "kv_quant", kvq)
                     setattr(me, "kv_quant_cfg", kvq_cfg)
 
-                     try:
+                    try:
                         import vllm.model_executor.layers.lightning_attn as LA
                         LA.lightning_attention._kvq_append = (lambda li, k, v: kvq.append_kv(li, k, v))
                         LA.lightning_attention._kvq_layer_idx = -1

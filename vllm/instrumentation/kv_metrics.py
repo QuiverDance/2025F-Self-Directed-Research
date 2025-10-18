@@ -257,6 +257,7 @@ class KVMetricsCollector:
         self._t_end: Dict[str, float] = {}
         self._finished: set[str] = set()  # guard double-flush
         self._lock = threading.Lock()
+        self._kvq_ref: Any = None
         # Track inflight requests so we can write summary immediately when all finish.
         self._inflight: set[str] = set()
         # per-request baseline of engine-global KV usage (bytes)
@@ -274,6 +275,11 @@ class KVMetricsCollector:
     def link_engine(self, engine_like: Any) -> None:
         """Keep a weak-ish reference to engine internals for KV snapshots."""
         self._engine_ref = engine_like
+
+    def set_kv_quant(self, kvq: Any) -> None:
+        with self._lock:
+            if kvq is not None and hasattr(kvq, "bytes_summary"):
+                self._kvq_ref = kvq
 
     def _kv_bytes_snapshot(self) -> Dict[str, int]:
         """Compute KV bytes from (a) direct counters or (b) used_blocks*block_bytes.
@@ -354,10 +360,11 @@ class KVMetricsCollector:
                 pass
 
             qpacked = 0
+            kvq = None
             try:
-                kvq = _get_kvq_from_engine(getattr(self, "_engine_ref", None))
-                if kvq is not None:
-                    bs = kvq.bytes_summary()  # {"kv_bytes_total_packed": ..., "kv_bytes_scales": ...}
+                kvq = getattr(self, "_kvq_ref", None)
+                if kvq is not None and hasattr(kvq, "bytes_summary"):
+                    bs = kvq.bytes_summary()
                     qpacked = int(bs.get("kv_bytes_total_packed", 0) or 0)
             except Exception:
                 qpacked = 0

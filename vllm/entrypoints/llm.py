@@ -307,6 +307,13 @@ class LLM:
                     setattr(me, "kv_quant", kvq)
                     setattr(me, "kv_quant_cfg", kvq_cfg)
 
+                    # provide kvq handle to metrics collector
+                    try:
+                        from vllm.instrumentation.kv_metrics import KVMetricsCollector
+                        KVMetricsCollector.get().set_kv_quant(kvq)
+                    except Exception:
+                        pass
+
                     try:
                         import torch
                         from vllm.v1.attention.backends.flex_attention import FlexAttentionImpl

@@ -347,7 +347,7 @@ class PagedKVCacheQuantized:
             print(_cuda_mem_snapshot(f"after-dequant L{layer_idx}"), flush=True)
             # show scratch sizes
             print(f"[KVQDBG] L{layer_idx} scratch shapes: K{tuple(out_k.shape)} V{tuple(out_v.shape)}", flush=True)
-         return out_k, out_v
+        return out_k, out_v
 
     # Simple metric helpers
     def bytes_summary(self) -> Dict[str, int]:

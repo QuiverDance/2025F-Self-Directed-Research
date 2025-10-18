@@ -320,14 +320,44 @@ class LLM:
                         if not getattr(FlexAttentionImpl, "_kvq_wrapped", False):
                             _orig_forward = FlexAttentionImpl.forward
                             _li_map = {}
+                            def _layer_idx_for(module):
+                                # stable per-module layer id
+                                if not hasattr(module, "_kvq_layer_idx"):
+                                    _li_map.setdefault(id(module), len(_li_map))
+                                    setattr(module, "_kvq_layer_idx", _li_map[id(module)])
+                                return getattr(module, "_kvq_layer_idx")
+
                             def _wrapped_forward(self, *args, **kwargs):
-                                k_like = args[2] if len(args) > 2 and isinstance(args[2], torch.Tensor) else None
-                                v_like = args[3] if len(args) > 3 and isinstance(args[3], torch.Tensor) else None
-                                if isinstance(k_like, torch.Tensor) and isinstance(v_like, torch.Tensor):
-                                    li = _li_map.setdefault(id(self), len(_li_map))
+                                import torch as _torch
+                                # args = (q, k, v, ...)
+                                k_like = args[2] if len(args) > 2 and isinstance(args[2], _torch.Tensor) else None
+                                v_like = args[3] if len(args) > 3 and isinstance(args[3], _torch.Tensor) else None
+                                if isinstance(k_like, _torch.Tensor) and isinstance(v_like, _torch.Tensor):
+                                    li = _layer_idx_for(self)
+                                    # 1) append -> quantized side cache only
                                     kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
+                                    # 2) replace runtime K/V by dequantized slice
+                                    #    match time window with incoming K/V (T,H,D)
+                                    Twant = int(k_like.shape[0])
+                                    # take the last Twant tokens from the accumulated layer cache
+                                    try:
+                                        # (safe indices)
+                                        stT = int(kvq.layers[li].T)
+                                        start = max(0, stT - Twant)
+                                        Kdq, Vdq = kvq.dequant_slice(li, slice(start, stT))
+                                        # ensure dtype/device match
+                                        Kdq = Kdq.to(dtype=k_like.dtype, device=k_like.device, non_blocking=True)
+                                        Vdq = Vdq.to(dtype=v_like.dtype, device=v_like.device, non_blocking=True)
+                                        # swap in arguments
+                                        _args = list(args)
+                                        _args[2] = Kdq
+                                        _args[3] = Vdq
+                                        args = tuple(_args)
+                                    except Exception:
+                                        # fall back to the original tensors on any error
+                                        pass
                                 return _orig_forward(self, *args, **kwargs)
-                            FlexAttentionImpl.forward = _wrapped_forward
+                            FlexAttentionImpl.forward = _wrapped_forward  # type: ignore[method-assign]
                             FlexAttentionImpl._kvq_wrapped = True
                             print("[KVQ] FlexAttention integration: FlexAttentionImpl.forward wrapped.", flush=True)
                     except Exception as _e:

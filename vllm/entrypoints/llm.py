@@ -248,15 +248,16 @@ class LLM:
         # If the user enabled kv_quant, we don't want vLLM's native FP16 KV to allocate GPU memory.
         kvq_enable_flag = bool(kwargs.get("kv_quant_enable", False))
         if kvq_enable_flag:
-            if kv_cache_memory_bytes is None:
-                kv_cache_memory_bytes = 0
-            # Prefix caching relies on native KV — disable to save memory
-            enable_prefix_caching = False
-            # Remove any duplicates that might have slipped into kwargs
-            kwargs.pop("kv_cache_memory_bytes", None)
-            kwargs.pop("enable_prefix_caching", None)
-            print(f"[KVQ] Native FP16 KV disabled (kv_cache_memory_bytes={kv_cache_memory_bytes}), "
-                  f"prefix_caching={enable_prefix_caching}.", flush=True)
+            import os
+            # set native kv cache size to 0 bytes
+            kwargs.setdefault("kv_cache_memory_bytes", 0)
+            # release native fp16 kv memory pressure
+            kwargs.setdefault("enforce_eager", True)
+            # set prefix caching to False
+            kwargs.setdefault("enable_prefix_caching", False)
+            # fragmentation mitigation
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+            print("[KVQ] Native FP16 KV disabled; enforce_eager=True; prefix_caching=False", flush=True)
 
 
         engine_args = EngineArgs(
@@ -375,7 +376,7 @@ class LLM:
                                     # determine stage by Twant
                                     Twant = int(k_like.shape[0])
                                     stage = "DECODE" if Twant <= _DECODE_T_MAX else "PREFILL"
-                                    
+
                                     if (kvq.debug and (kvq.layers[li].T % _DBG_EVERY == 0)):
                                         print(f"[KVQDBG] >>> Forward L{li} stage={stage} T={Twant} K{tuple(k_like.shape)} V{tuple(v_like.shape)} dev={k_like.device}", flush=True)
                                         _memsnap(f"L{li} {stage} pre-append")

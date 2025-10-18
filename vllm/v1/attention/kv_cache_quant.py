@@ -337,83 +337,65 @@ class PagedKVCacheQuantized:
         import torch
         st = self.layers[layer_idx]
 
+        # --- validate inputs ---
         assert isinstance(K, torch.Tensor) and isinstance(V, torch.Tensor)
         assert K.device == self.device and V.device == self.device, "K/V must be on kvq device"
         assert K.dtype in (torch.float16, torch.bfloat16) and V.dtype in (torch.float16, torch.bfloat16)
-        assert K.shape == V.shape and K.ndim == 3, f"Expected K/V [T,H,D], got {K.shape}, {V.shape}"
+        assert K.ndim == 3 and V.ndim == 3 and K.shape == V.shape, f"Expected [T,H,D], got {K.shape}, {V.shape}"
 
-        # Ensure contiguous for packers
-        K = K.contiguous()
-        V = V.contiguous()
-
+        # make contiguous for packers
+        K = K.contiguous(); V = V.contiguous()
         T_new, H_in, D_in = K.shape
 
-        # ---- Initialize or validate H/D ----
-        # Treat 0 or None as "uninitialized".
-        H_set = int(getattr(st, "H", 0) or 0)
-        D_set = int(getattr(st, "D", 0) or 0)
-        if H_set > 0 and D_set > 0:
-            assert (H_in, D_in) == (st.H, st.D), \
-                f"Shape mismatch: got H,D=({H_in},{D_in}) expected ({st.H},{st.D})"
+        # --- init or check H/D (treat 0 as uninitialized) ---
+        if int(getattr(st, "H", 0) or 0) > 0 and int(getattr(st, "D", 0) or 0) > 0:
+            assert (H_in, D_in) == (st.H, st.D), f"Shape mismatch: got H,D=({H_in},{D_in}) expected ({st.H},{st.D})"
         else:
             st.H, st.D = int(H_in), int(D_in)
 
-        # ---- Quantize & pack ----
-        K_packed, K_scale = _quantize_symmetric(
-            K, bits=st.bits_k, group_size=st.group_size,
-            granularity=st.granularity, symmetric=st.symmetric
-        )
-        V_packed, V_scale = _quantize_symmetric(
-            V, bits=st.bits_v, group_size=st.group_size,
-            granularity=st.granularity, symmetric=st.symmetric
-        )
+        # --- quantize & pack (no 'symmetric' kw; current impl doesn't take it) ---
+        qk, sk = _quantize_symmetric(K, bits=st.bits_k, group_size=st.group_size, granularity=st.granularity)
+        qv, sv = _quantize_symmetric(V, bits=st.bits_v, group_size=st.group_size, granularity=st.granularity)
 
-        def _cat0(old: torch.Tensor | None, new: torch.Tensor) -> torch.Tensor:
-            # Append along time dim=0; handle None or 0-sized tensors safely.
+        # helper: safe cat along time (dim=0)
+        def _cat0(old: Optional[torch.Tensor], new: torch.Tensor) -> torch.Tensor:
             if old is None or (isinstance(old, torch.Tensor) and old.numel() == 0):
                 return new.contiguous()
             return torch.cat([old, new], dim=0).contiguous()
 
-        # ---- Append packed tensors (time axis) ----
-        st.K_packed = _cat0(st.K_packed, K_packed)
-        st.V_packed = _cat0(st.V_packed, V_packed)
+        # --- append packed ---
+        st.K_packed = _cat0(st.K_packed, qk)
+        st.V_packed = _cat0(st.V_packed, qv)
 
-        # ---- Scales handling ----
+        # --- scales handling ---
+        # per_token_head: scales depend on time → append along T
+        # otherwise: time-invariant → set once on first write
+        first_append = (int(getattr(st, "T", 0)) == 0)
         if st.granularity == "per_token_head":
-            st.K_scale = _cat0(st.K_scale, K_scale)
-            st.V_scale = _cat0(st.V_scale, V_scale)
+            st.K_scale = _cat0(st.K_scale, sk)
+            st.V_scale = _cat0(st.V_scale, sv)
         else:
-            # time-invariant scales: set once
-            if st.K_scale is None or (isinstance(st.K_scale, torch.Tensor) and st.K_scale.numel() == 0):
-                st.K_scale = K_scale.contiguous()
-            if st.V_scale is None or (isinstance(st.V_scale, torch.Tensor) and st.V_scale.numel() == 0):
-                st.V_scale = V_scale.contiguous()
+            if first_append or st.K_scale is None or (isinstance(st.K_scale, torch.Tensor) and st.K_scale.numel() == 0):
+                st.K_scale = sk.contiguous()
+            if first_append or st.V_scale is None or (isinstance(st.V_scale, torch.Tensor) and st.V_scale.numel() == 0):
+                st.V_scale = sv.contiguous()
 
-        # ---- Update time cursor ----
+        # --- update time cursor ---
         st.T = int(st.T) + int(T_new)
 
-        # ---- Byte accounting ----
-        if not hasattr(self, "_bytes_total_packed"):
-            self._bytes_total_packed = 0
-        if not hasattr(self, "_bytes_scales"):
-            self._bytes_scales = 0
-
-        packed_bytes_add = int(K_packed.numel() * K_packed.element_size() +
-                            V_packed.numel() * V_packed.element_size())
-        self._bytes_total_packed += packed_bytes_add
-
+        # --- byte accounting (match file's counters: bytes_total / bytes_scales) ---
+        self.bytes_total += int(qk.numel() * qk.element_size()) + int(qv.numel() * qv.element_size())
         if st.granularity == "per_token_head":
-            self._bytes_scales += int(K_scale.numel() * K_scale.element_size() +
-                                    V_scale.numel() * V_scale.element_size())
+            self.bytes_scales += int(sk.numel() * sk.element_size()) + int(sv.numel() * sv.element_size())
         else:
-            if not hasattr(st, "_scales_accounted") or not getattr(st, "_scales_accounted"):
-                self._bytes_scales += int(K_scale.numel() * K_scale.element_size() +
-                                        V_scale.numel() * V_scale.element_size())
-                st._scales_accounted = True
+            if first_append:
+                self.bytes_scales += int(sk.numel() * sk.element_size()) + int(sv.numel() * sv.element_size())
 
+        # --- optional debug ---
         if getattr(self, "debug", False):
-            print(f"[KVQDBG] L{layer_idx} _append_core: +packed={packed_bytes_add}B "
-                f"(tot={self._bytes_total_packed}B)", flush=True)
+            print(f"[KVQDBG] L{layer_idx} _append_core: +packed={qk.numel()*qk.element_size() + qv.numel()*qv.element_size()}B "
+                f"(tot={self.bytes_total}B)", flush=True)
+
 
 
     def dequant_slice(self, layer_idx: int, t_slice: slice) -> Tuple[torch.Tensor, torch.Tensor]:

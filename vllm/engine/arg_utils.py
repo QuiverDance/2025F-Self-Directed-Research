@@ -472,6 +472,7 @@ class EngineArgs:
     kv_quant_config: Optional[str] = None
     kv_quant_validate: bool = False
     kv_quant_fused_attn: bool = False
+    kv_quant_debug: bool = False
     kv_quant_log_path: Optional[str] = None
     kv_quant_log_interval: int = 128
 
@@ -927,6 +928,8 @@ class EngineArgs:
                         help="Validate bitwidth/shape alignment at startup; fallback to 8bit on failure.")
         quantization_group.add_argument("--kv-quant-fused-attn", action="store_true",
                         help="(Experimental) Use fused dequant+attention when available.")
+        quantization_group.add_argument("--kv-quant-debug", action="store_true",
+                        help="Enable debug mode for KV quantization.")
         quantization_group.add_argument("--kv-quant-log-path", type=str, default=None,
                         help="If set, write kv-quant metrics as JSONL to this file.")
         quantization_group.add_argument("--kv-quant-log-interval", type=int, default=128,

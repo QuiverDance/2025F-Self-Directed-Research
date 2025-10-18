@@ -250,9 +250,9 @@ class LLM:
         if kvq_enable_flag:
             import os
             # set native kv cache size to 0 bytes
-            kwargs.setdefault("kv_cache_memory_bytes", 0)
+            kv_cache_memory_bytes = 0
             # release native fp16 kv memory pressure
-            kwargs.setdefault("enforce_eager", True)
+            enforce_eager = True
             # set prefix caching to False
             # kwargs.setdefault("enable_prefix_caching", False)
             # fragmentation mitigation

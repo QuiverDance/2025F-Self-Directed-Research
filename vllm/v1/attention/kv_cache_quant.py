@@ -225,10 +225,10 @@ class PagedKVCacheQuantized:
         """Append one step of K,V: shapes [H,D] (single token) or [T,H,D]."""
         # === DEBUG: before-append snapshot ===
         if self.debug and (self.layers[layer_idx].T == 0):
-            print(f"[KVQDBG] L{layer_idx} first-append: K/V shape={tuple(K.shape)} device={K.device} dtype={K.dtype}", flush=True)
+            print(f"[KVQDBG] L{layer_idx} first-append: K/V shape={tuple(k.shape)} device={k.device} dtype={k.dtype}", flush=True)
             print(_cuda_mem_snapshot(f"before-append L{layer_idx}"), flush=True)
         elif self.debug and (self.layers[layer_idx].T % self.debug_interval == 0):
-            print(f"[KVQDBG] L{layer_idx} append@T={self.layers[layer_idx].T}: incoming {tuple(K.shape)}", flush=True)
+            print(f"[KVQDBG] L{layer_idx} append@T={self.layers[layer_idx].T}: incoming {tuple(k.shape)}", flush=True)
 
         st = self.layers[layer_idx]
         assert k.shape == v.shape and k.dim() in (2,3)

@@ -503,7 +503,7 @@ class KVMetricsCollector:
                     pass
             for d in (self._req, self._t_start, self._t_first, self._t_end):
                 d.pop(request_id, None)
-            print("[KVCHK-WRITE] wrote jsonl line for", request_id)
+            # print("[KVCHK-WRITE] wrote jsonl line for", request_id)
 
     def count_generated_token(self, request_id: str, is_eos: bool = False) -> None:
         """Increment generated_len for non-EOS tokens."""

@@ -711,7 +711,7 @@ class LLMEngine:
 
     def _kv_on_request_end(self, request_id: str) -> None:
         """Take 'decode' snapshot and flush the record."""
-        print("KV: request end start", request_id)
+        # print("KV: request end start", request_id)
         cfg = getattr(self._kv_metrics, "cfg", None)
         if not cfg or not cfg.enabled:
             return

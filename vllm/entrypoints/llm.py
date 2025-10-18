@@ -244,6 +244,18 @@ class LLM:
         else:
             compilation_config_instance = CompilationConfig()
 
+        # ---------------- [KVQ] kill native FP16 KV allocation when kv-quant is ON ---------------
+        # If the user enabled kv_quant, we don't want vLLM's native FP16 KV to allocate GPU memory.
+        kvq_enable_flag = bool(kwargs.get("kv_quant_enable", False))
+        if kvq_enable_flag:
+            # (1) Zero out native KV reservation
+            if "kv_cache_memory_bytes" not in kwargs:
+                kwargs["kv_cache_memory_bytes"] = 0
+            if "enable_prefix_caching" not in kwargs:
+                kwargs["enable_prefix_caching"] = False
+            print("[KVQ] Native FP16 KV disabled (kv_cache_memory_bytes=0).", flush=True)
+
+
         engine_args = EngineArgs(
             model=model,
             runner=runner,

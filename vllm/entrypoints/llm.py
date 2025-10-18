@@ -256,7 +256,7 @@ class LLM:
             # set prefix caching to False
             # kwargs.setdefault("enable_prefix_caching", False)
             # fragmentation mitigation
-            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+            # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
             print("[KVQ] Native FP16 KV disabled; enforce_eager=True; prefix_caching=False", flush=True)
 
 
@@ -289,7 +289,6 @@ class LLM:
             override_pooler_config=override_pooler_config,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
-            enable_prefix_caching=enable_prefix_caching,
             **kwargs,
         )
 

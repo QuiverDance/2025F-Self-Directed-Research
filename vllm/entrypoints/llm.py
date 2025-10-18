@@ -365,12 +365,17 @@ class LLM:
                             def _wrapped_forward(self, *args, **kwargs):
                                 import torch as _torch
                                 # args = (q, k, v, ...)
-                                k_like = args[2] if len(args) > 2 and isinstance(args[2], _torch.Tensor) else None
-                                v_like = args[3] if len(args) > 3 and isinstance(args[3], _torch.Tensor) else None
+                                if len(args) < 4:
+                                    return _orig_forward(self, *args, **kwargs)
+                                k_like = args[2]; v_like = args[3]
                                 if isinstance(k_like, _torch.Tensor) and isinstance(v_like, _torch.Tensor):
                                     li = _layer_idx_for(self)
                                     # append -> quantized side cache only
+
+                                    # determine stage by Twant
+                                    Twant = int(k_like.shape[0])
                                     stage = "DECODE" if Twant <= _DECODE_T_MAX else "PREFILL"
+                                    
                                     if (kvq.debug and (kvq.layers[li].T % _DBG_EVERY == 0)):
                                         print(f"[KVQDBG] >>> Forward L{li} stage={stage} T={Twant} K{tuple(k_like.shape)} V{tuple(v_like.shape)} dev={k_like.device}", flush=True)
                                         _memsnap(f"L{li} {stage} pre-append")
@@ -378,8 +383,6 @@ class LLM:
                                     # 1) always append(quantize+pack); we do NOT keep a pointer to fp16 K/V here
                                     kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
 
-                                    # prefill or decode step
-                                    Twant = int(k_like.shape[0])
                                     if Twant <= _DECODE_T_MAX:
                                         # ---- decode: dequant into scratch & swap-in ----
                                         Tcur = int(kvq.layers[li].T)

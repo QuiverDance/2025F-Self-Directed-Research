@@ -26,7 +26,7 @@ def _fmt_bytes(n: Optional[int]) -> Optional[str]:
         v = float(int(n))
     except Exception:
         return None
-    units = ["B","KB","MB","GB","TB","PB"]
+    units = ["B","KiB","MiB","GiB","TiB","PiB"]
     i = 0
     while v >= 1024.0 and i < len(units)-1:
         v /= 1024.0

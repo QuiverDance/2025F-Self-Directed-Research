@@ -173,6 +173,22 @@ def _unpack_2bit_signed(packed: torch.Tensor, T: int, H: int, D: int) -> torch.T
     out[..., 3::4] = a3
     return out.to(torch.float32)
 
+def _infer_teff_from_padding(K: torch.Tensor, *, every_n: int = 1) -> int:
+    """Heuristically infer effective T (#valid tokens) by detecting trailing
+    all-zero rows along time axis. Works when compiler pads to a fixed T (e.g., 8192).
+    Cost: O(T*H*D) read once per layer at first prefill (and rare repeats)."""
+    # K: [T, H, D] on CUDA. We only need to know which rows are all-zeros.
+    # Downsample over time if needed (every_n>1) for very long T, then refine.
+    T = K.shape[0]
+    # Fast path: reduce over feature dims → [T]
+    # NOTE: use fp16->fp32 reduction to avoid overflow/underflow issues.
+    flat = K.abs().reshape(T, -1).sum(dim=1)  # [T], fp16->fp16 sum is fine here
+    nz = (flat != 0)
+    if not bool(nz.any()):
+        return 0
+    teff = int(nz.nonzero()[-1].item()) + 1  # last nonzero + 1
+    return teff
+
 # -------------------------
 # Quantized KV cache
 # -------------------------
@@ -293,6 +309,132 @@ class PagedKVCacheQuantized:
             print(f"[KVQDBG] L{layer_idx} after-append: packed={packed} bytes, scales={scales} bytes", flush=True)
             print(_cuda_mem_snapshot(f"after-append L{layer_idx}"), flush=True)
 
+    def append_kv_prefill(self, layer_idx: int, K: torch.Tensor, V: torch.Tensor) -> None:
+        """
+        Append-only for prefill phase with padding-aware effective length.
+        """
+        st = self.layers[layer_idx]
+        T_in = int(K.shape[0])
+        # approximate T_eff by checking trailing all-zero rows in K
+        T_eff = _infer_teff_from_padding(K)
+        if self.debug:
+            print(f"[KVQDBG] L{layer_idx} PREFILL infer T_eff={T_eff} (T_in={T_in})", flush=True)
+        if T_eff == 0:
+            return  # nothing to store
+        # if already have >= T_eff, skip
+        T_have = int(st.T)
+        if T_eff <= T_have:
+            if self.debug:
+                print(f"[KVQDBG] L{layer_idx} PREFILL skip (dup): have={T_have}, incoming={T_eff}", flush=True)
+            return
+        # save K,V from T_have to T_eff
+        K_use = K[T_have:T_eff].contiguous()
+        V_use = V[T_have:T_eff].contiguous()
+        self._append_core(layer_idx, K_use, V_use)
+
+    def _append_core(self, layer_idx: int, K: torch.Tensor, V: torch.Tensor) -> None:
+        """Core routine that actually quantizes & appends packed K/V (and scales)
+        into the per-layer storage.
+
+        Args:
+            layer_idx: layer id
+            K, V: float16 tensors of shape [T, H, D] on self.device
+        """
+        import torch
+
+        st = self.layers[layer_idx]
+        assert isinstance(K, torch.Tensor) and isinstance(V, torch.Tensor)
+        assert K.device == self.device and V.device == self.device, "K/V must be on kvq device"
+        assert K.dtype in (torch.float16, torch.bfloat16) and V.dtype in (torch.float16, torch.bfloat16)
+        assert K.shape == V.shape and K.ndim == 3, f"Expected K/V [T,H,D], got {K.shape}, {V.shape}"
+
+        T_new, H_in, D_in = K.shape
+        # Sanity: H,D must match the layer descriptor
+        if st.H is not None and st.D is not None:
+            assert (H_in, D_in) == (st.H, st.D), f"Shape mismatch: got H,D=({H_in},{D_in}) expected ({st.H},{st.D})"
+        else:
+            # Initialize H/D on first write (defensive)
+            st.H, st.D = int(H_in), int(D_in)
+
+        # ---- Quantize & pack for K ----
+        # _quantize_symmetric returns (packed_or_q, scale) where:
+        #   bits=8  -> packed_or_q: int8  of shape [T,H,D]
+        #   bits=4  -> packed_or_q: int8  of shape [T,H,D//2] (nibble-packed)
+        #   bits=2  -> packed_or_q: int8  of shape [T,H,D//4] (2-bit packed)
+        K_packed, K_scale = _quantize_symmetric(
+            K, bits=st.bits_k, group_size=st.group_size,
+            granularity=st.granularity, symmetric=st.symmetric
+        )
+
+        # ---- Quantize & pack for V ----
+        V_packed, V_scale = _quantize_symmetric(
+            V, bits=st.bits_v, group_size=st.group_size,
+            granularity=st.granularity, symmetric=st.symmetric
+        )
+
+        # ---- Append packed tensors (time axis concat) ----
+        if st.K_packed is None:
+            st.K_packed = K_packed.contiguous()
+        else:
+            st.K_packed = torch.cat([st.K_packed, K_packed], dim=0).contiguous()
+
+        if st.V_packed is None:
+            st.V_packed = V_packed.contiguous()
+        else:
+            st.V_packed = torch.cat([st.V_packed, V_packed], dim=0).contiguous()
+
+        # ---- Scales handling ----
+        # For per_token_head granularity: scales are per-time; append along T.
+        # Otherwise (per_channel/grouped): scales are time-invariant; set once and keep.
+        if st.granularity == "per_token_head":
+            if st.K_scale is None:
+                st.K_scale = K_scale.contiguous()
+            else:
+                st.K_scale = torch.cat([st.K_scale, K_scale], dim=0).contiguous()
+
+            if st.V_scale is None:
+                st.V_scale = V_scale.contiguous()
+            else:
+                st.V_scale = torch.cat([st.V_scale, V_scale], dim=0).contiguous()
+        else:
+            # time-invariant scales: store on first write; optionally verify later
+            if st.K_scale is None:
+                st.K_scale = K_scale.contiguous()
+            # else: keep existing st.K_scale
+
+            if st.V_scale is None:
+                st.V_scale = V_scale.contiguous()
+            # else: keep existing st.V_scale
+
+        # ---- Update time cursor ----
+        st.T = int(st.T) + int(T_new)
+
+        # ---- Byte accounting (robust to first use) ----
+        # We count bytes for packed tensors, and (only what we added) for scales.
+        packed_bytes_add = int(K_packed.numel() * K_packed.element_size() +
+                            V_packed.numel() * V_packed.element_size())
+
+        if not hasattr(self, "_bytes_total_packed"):
+            self._bytes_total_packed = 0
+        self._bytes_total_packed += packed_bytes_add
+
+        if not hasattr(self, "_bytes_scales"):
+            self._bytes_scales = 0
+
+        if st.granularity == "per_token_head":
+            # appended both K_scale and V_scale along T
+            self._bytes_scales += int(K_scale.numel() * K_scale.element_size() +
+                                    V_scale.numel() * V_scale.element_size())
+        else:
+            # time-invariant: only the first set contributes; approximate via sentinel
+            if not hasattr(st, "_scales_accounted"):
+                self._bytes_scales += int(K_scale.numel() * K_scale.element_size() +
+                                        V_scale.numel() * V_scale.element_size())
+                st._scales_accounted = True
+
+        if getattr(self, "debug", False):
+            print(f"[KVQDBG] L{layer_idx} _append_core: +packed={packed_bytes_add}B "
+                f"(tot={self._bytes_total_packed}B)", flush=True)
 
     def dequant_slice(self, layer_idx: int, t_slice: slice) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return fp16 K,V for given time slice [start:stop]. Shapes [T,H,D]."""

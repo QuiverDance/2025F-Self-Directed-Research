@@ -380,8 +380,11 @@ class LLM:
                                         print(f"[KVQDBG] >>> Forward L{li} stage={stage} T={Twant} K{tuple(k_like.shape)} V{tuple(v_like.shape)} dev={k_like.device}", flush=True)
                                         _memsnap(f"L{li} {stage} pre-append")
 
-                                    # 1) always append(quantize+pack); we do NOT keep a pointer to fp16 K/V here
-                                    kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
+                                    # 1) PREFILL/DECODE handling
+                                    if Twant > _DECODE_T_MAX:
+                                        kvq.append_kv_prefill(li, k_like.contiguous(), v_like.contiguous())
+                                    else:
+                                        kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
 
                                     if Twant <= _DECODE_T_MAX:
                                         # ---- decode: dequant into scratch & swap-in ----

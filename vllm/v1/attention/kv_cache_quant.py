@@ -295,6 +295,31 @@ class PagedKVCacheQuantized:
         V = _dequantize_symmetric(Vp, Vs, st.bits_v, st.group_size, st.granularity, T=T, H=st.H, D=st.D)
         return K, V
 
+    def dequant_slice_into(
+        self, layer_idx: int, t_slice: slice,
+        out_k: torch.Tensor, out_v: torch.Tensor
+    ):
+        """Dequantize [start:stop] directly into provided GPU scratch buffers."""
+        st = self.layers[layer_idx]
+        start, stop, _ = t_slice.indices(st.T)
+        T = stop - start
+        # (packed/scales)
+        Kp = st.K_packed[start:stop]; Vp = st.V_packed[start:stop]
+        if st.granularity == "per_token_head":
+            Ks = st.K_scale[start:stop]; Vs = st.V_scale[start:stop]
+        else:
+            Ks = st.K_scale; Vs = st.V_scale
+        K = _dequantize_symmetric(Kp, Ks, st.bits_k, st.group_size, st.granularity,
+                                  T=T, H=st.H, D=st.D)
+        V = _dequantize_symmetric(Vp, Vs, st.bits_v, st.group_size, st.granularity,
+                                  T=T, H=st.H, D=st.D)
+        # copy into out scratch
+        if out_k.shape != K.shape: out_k.resize_(K.shape)
+        if out_v.shape != V.shape: out_v.resize_(V.shape)
+        out_k.copy_(K, non_blocking=True)
+        out_v.copy_(V, non_blocking=True)
+        return out_k, out_v
+
     # Simple metric helpers
     def bytes_summary(self) -> Dict[str, int]:
         return {"kv_bytes_total_packed": int(self.bytes_total), "kv_bytes_scales": int(self.bytes_scales)}

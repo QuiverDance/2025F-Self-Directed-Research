@@ -335,6 +335,7 @@ class LLM:
                         from vllm.v1.attention.backends.flex_attention import FlexAttentionImpl
                         if not getattr(FlexAttentionImpl, "_kvq_wrapped", False):
                             _orig_forward = FlexAttentionImpl.forward
+                            _DECODE_T_MAX = 1 
                             _li_map = {}
                             def _layer_idx_for(module):
                                 # stable per-module layer id
@@ -350,27 +351,35 @@ class LLM:
                                 v_like = args[3] if len(args) > 3 and isinstance(args[3], _torch.Tensor) else None
                                 if isinstance(k_like, _torch.Tensor) and isinstance(v_like, _torch.Tensor):
                                     li = _layer_idx_for(self)
-                                    # 1) append -> quantized side cache only
+                                    # append -> quantized side cache only
                                     kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
-                                    # 2) replace runtime K/V by dequantized slice
-                                    #    match time window with incoming K/V (T,H,D)
+                                    # prefill or decode step
                                     Twant = int(k_like.shape[0])
-                                    # take the last Twant tokens from the accumulated layer cache
-                                    try:
-                                        # (safe indices)
-                                        stT = int(kvq.layers[li].T)
-                                        start = max(0, stT - Twant)
-                                        Kdq, Vdq = kvq.dequant_slice(li, slice(start, stT))
-                                        # ensure dtype/device match
-                                        Kdq = Kdq.to(dtype=k_like.dtype, device=k_like.device, non_blocking=True)
-                                        Vdq = Vdq.to(dtype=v_like.dtype, device=v_like.device, non_blocking=True)
-                                        # swap in arguments
+                                    if Twant <= _DECODE_T_MAX:
+                                        # ---- Decode step ----
+                                        Tcur = int(kvq.layers[li].T)
+                                        start = max(0, Tcur - Twant)
+                                        # initialize or resize scratch buffers
+                                        if (getattr(self, "_kvq_kbuf", None) is None or
+                                            self._kvq_kbuf.device != k_like.device or
+                                            self._kvq_kbuf.dtype  != k_like.dtype  or
+                                            self._kvq_kbuf.shape[-2:] != k_like.shape[-2:]):
+                                            H, D = int(k_like.shape[1]), int(k_like.shape[2])
+                                            self._kvq_kbuf = _torch.empty((Twant, H, D), dtype=k_like.dtype, device=k_like.device)
+                                            self._kvq_vbuf = _torch.empty((Twant, H, D), dtype=v_like.dtype, device=v_like.device)
+                                        else:
+                                            # if capacity ok, just resize to view (no new alloc)
+                                            self._kvq_kbuf.resize_((Twant, k_like.shape[1], k_like.shape[2]))
+                                            self._kvq_vbuf.resize_((Twant, v_like.shape[1], v_like.shape[2]))
+                                        # in-place dequant: fill the scratch via kvq's into-API
+                                        kvq.dequant_slice_into(li, slice(start, Tcur), self._kvq_kbuf, self._kvq_vbuf)
+                                        # replace args with the dequantized buffers
                                         _args = list(args)
-                                        _args[2] = Kdq
-                                        _args[3] = Vdq
+                                        _args[2] = self._kvq_kbuf
+                                        _args[3] = self._kvq_vbuf
                                         args = tuple(_args)
-                                    except Exception:
-                                        # fall back to the original tensors on any error
+                                    else:
+                                        # ---- Prefill step: never dequantize (no large temp tensors) ----
                                         pass
                                 return _orig_forward(self, *args, **kwargs)
                             FlexAttentionImpl.forward = _wrapped_forward  # type: ignore[method-assign]

@@ -254,7 +254,7 @@ class LLM:
             # release native fp16 kv memory pressure
             kwargs.setdefault("enforce_eager", True)
             # set prefix caching to False
-            kwargs.setdefault("enable_prefix_caching", False)
+            # kwargs.setdefault("enable_prefix_caching", False)
             # fragmentation mitigation
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
             print("[KVQ] Native FP16 KV disabled; enforce_eager=True; prefix_caching=False", flush=True)

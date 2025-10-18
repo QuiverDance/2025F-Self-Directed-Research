@@ -248,12 +248,15 @@ class LLM:
         # If the user enabled kv_quant, we don't want vLLM's native FP16 KV to allocate GPU memory.
         kvq_enable_flag = bool(kwargs.get("kv_quant_enable", False))
         if kvq_enable_flag:
-            # (1) Zero out native KV reservation
-            if "kv_cache_memory_bytes" not in kwargs:
-                kwargs["kv_cache_memory_bytes"] = 0
-            if "enable_prefix_caching" not in kwargs:
-                kwargs["enable_prefix_caching"] = False
-            print("[KVQ] Native FP16 KV disabled (kv_cache_memory_bytes=0).", flush=True)
+            if kv_cache_memory_bytes is None:
+                kv_cache_memory_bytes = 0
+            # Prefix caching relies on native KV — disable to save memory
+            enable_prefix_caching = False
+            # Remove any duplicates that might have slipped into kwargs
+            kwargs.pop("kv_cache_memory_bytes", None)
+            kwargs.pop("enable_prefix_caching", None)
+            print(f"[KVQ] Native FP16 KV disabled (kv_cache_memory_bytes={kv_cache_memory_bytes}), "
+                  f"prefix_caching={enable_prefix_caching}.", flush=True)
 
 
         engine_args = EngineArgs(
@@ -285,6 +288,8 @@ class LLM:
             override_pooler_config=override_pooler_config,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
+            enable_prefix_caching=enable_prefix_caching,
             **kwargs,
         )
 

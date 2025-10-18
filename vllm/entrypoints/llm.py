@@ -314,7 +314,7 @@ class LLM:
                 if me is not None:
                     n_layers = getattr(me, "num_hidden_layers", None) or getattr(self.llm_engine, "num_hidden_layers", None) or 32
                     dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-                    debug_flag = bool(kwargs.get("kv_quant_debug", True))
+                    # debug_flag = bool(kwargs.get("kv_quant_debug", True))
                     debug_flag = True
                     debug_interval = int(kwargs.get("kv_quant_log_interval", 128))
                     kvq = PagedKVCacheQuantized(

@@ -199,7 +199,7 @@ class PagedKVCacheQuantized:
     Replace with paged allocator bindings for production.
     """
 
-    def __init__(self, n_layers: int, policies, device: torch.device):
+    def __init__(self, n_layers: int, policies, device: torch.device, debug: bool = False, debug_interval: int = 128):
         self.device = device
         self.layers: Dict[int, LayerKVStore] = {}
         self.policies = policies  # callable: layer_idx -> LayerPolicy

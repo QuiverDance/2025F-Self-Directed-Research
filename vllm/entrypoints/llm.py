@@ -288,7 +288,6 @@ class LLM:
             override_pooler_config=override_pooler_config,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
-            kv_cache_memory_bytes=kv_cache_memory_bytes,
             enable_prefix_caching=enable_prefix_caching,
             **kwargs,
         )

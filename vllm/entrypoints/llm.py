@@ -314,10 +314,14 @@ class LLM:
                 if me is not None:
                     n_layers = getattr(me, "num_hidden_layers", None) or getattr(self.llm_engine, "num_hidden_layers", None) or 32
                     dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+                    debug_flag = bool(kwargs.get("kv_quant_debug", True))
+                    debug_interval = int(kwargs.get("kv_quant_log_interval", 128))
                     kvq = PagedKVCacheQuantized(
                         n_layers=n_layers,
                         policies=kvq_cfg.policy_for,
                         device=dev,
+                        debug=debug_flag,
+                        debug_interval=debug_interval,
                     )
                     setattr(self.llm_engine, "kv_quant", kvq)
                     setattr(me, "kv_quant", kvq)
@@ -335,7 +339,8 @@ class LLM:
                         from vllm.v1.attention.backends.flex_attention import FlexAttentionImpl
                         if not getattr(FlexAttentionImpl, "_kvq_wrapped", False):
                             _orig_forward = FlexAttentionImpl.forward
-                            _DECODE_T_MAX = 1 
+                            _DECODE_T_MAX = 1
+                            _DBG_EVERY = int(kwargs.get("kv_quant_log_interval", 128))
                             _li_map = {}
                             def _layer_idx_for(module):
                                 # stable per-module layer id
@@ -343,6 +348,18 @@ class LLM:
                                     _li_map.setdefault(id(module), len(_li_map))
                                     setattr(module, "_kvq_layer_idx", _li_map[id(module)])
                                 return getattr(module, "_kvq_layer_idx")
+
+                            def _memsnap(tag: str):
+                                try:
+                                    import torch
+                                    if torch.cuda.is_available():
+                                        torch.cuda.synchronize()
+                                        free, total = torch.cuda.mem_get_info()
+                                        alloc = torch.cuda.memory_allocated()
+                                        reserv = torch.cuda.memory_reserved()
+                                        print(f"[KVQDBG] {tag} | free={free/2**20:.0f}MiB alloc={alloc/2**20:.0f}MiB reserved={reserv/2**20:.0f}MiB", flush=True)
+                                except Exception:
+                                    pass
 
                             def _wrapped_forward(self, *args, **kwargs):
                                 import torch as _torch
@@ -352,11 +369,18 @@ class LLM:
                                 if isinstance(k_like, _torch.Tensor) and isinstance(v_like, _torch.Tensor):
                                     li = _layer_idx_for(self)
                                     # append -> quantized side cache only
+                                    stage = "DECODE" if Twant <= _DECODE_T_MAX else "PREFILL"
+                                    if (kvq.debug and (kvq.layers[li].T % _DBG_EVERY == 0)):
+                                        print(f"[KVQDBG] >>> Forward L{li} stage={stage} T={Twant} K{tuple(k_like.shape)} V{tuple(v_like.shape)} dev={k_like.device}", flush=True)
+                                        _memsnap(f"L{li} {stage} pre-append")
+
+                                    # 1) always append(quantize+pack); we do NOT keep a pointer to fp16 K/V here
                                     kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
+
                                     # prefill or decode step
                                     Twant = int(k_like.shape[0])
                                     if Twant <= _DECODE_T_MAX:
-                                        # ---- Decode step ----
+                                        # ---- decode: dequant into scratch & swap-in ----
                                         Tcur = int(kvq.layers[li].T)
                                         start = max(0, Tcur - Twant)
                                         # initialize or resize scratch buffers
@@ -372,7 +396,11 @@ class LLM:
                                             self._kvq_kbuf.resize_((Twant, k_like.shape[1], k_like.shape[2]))
                                             self._kvq_vbuf.resize_((Twant, v_like.shape[1], v_like.shape[2]))
                                         # in-place dequant: fill the scratch via kvq's into-API
+                                        if kvq.debug:
+                                            _memsnap(f"L{li} {stage} before-dequant-into")
                                         kvq.dequant_slice_into(li, slice(start, Tcur), self._kvq_kbuf, self._kvq_vbuf)
+                                        if kvq.debug:
+                                            _memsnap(f"L{li} {stage} after-dequant-into")
                                         # replace args with the dequantized buffers
                                         _args = list(args)
                                         _args[2] = self._kvq_kbuf
@@ -380,6 +408,8 @@ class LLM:
                                         args = tuple(_args)
                                     else:
                                         # ---- Prefill step: never dequantize (no large temp tensors) ----
+                                        if kvq.debug and (kvq.layers[li].T % _DBG_EVERY == 0):
+                                            _memsnap(f"L{li} {stage} post-append (no-dequant)")
                                         pass
                                 return _orig_forward(self, *args, **kwargs)
                             FlexAttentionImpl.forward = _wrapped_forward  # type: ignore[method-assign]

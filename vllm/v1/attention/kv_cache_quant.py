@@ -208,6 +208,9 @@ class PagedKVCacheQuantized:
         self.bytes_total = 0
         self.bytes_scales = 0
 
+        self.debug = debug
+        self.debug_interval = max(1, int(debug_interval))
+
         for li in range(n_layers):
             p = policies(li)
             self.layers[li] = LayerKVStore(
@@ -220,6 +223,13 @@ class PagedKVCacheQuantized:
 
     def append_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
         """Append one step of K,V: shapes [H,D] (single token) or [T,H,D]."""
+        # === DEBUG: before-append snapshot ===
+        if self.debug and (self.layers[layer_idx].T == 0):
+            print(f"[KVQDBG] L{layer_idx} first-append: K/V shape={tuple(K.shape)} device={K.device} dtype={K.dtype}", flush=True)
+            print(_cuda_mem_snapshot(f"before-append L{layer_idx}"), flush=True)
+        elif self.debug and (self.layers[layer_idx].T % self.debug_interval == 0):
+            print(f"[KVQDBG] L{layer_idx} append@T={self.layers[layer_idx].T}: incoming {tuple(K.shape)}", flush=True)
+
         st = self.layers[layer_idx]
         assert k.shape == v.shape and k.dim() in (2,3)
         # normalize to [T,H,D]
@@ -274,6 +284,14 @@ class PagedKVCacheQuantized:
                 kv_bytes_scales=ks_bytes + vs_bytes,
                 tt=0.0,
             ))
+        
+        # === DEBUG: after-append snapshot ===
+        if self.debug:
+            bs = self.bytes_summary()
+            packed = bs.get("kv_bytes_total_packed", 0)
+            scales = bs.get("kv_bytes_scales", 0)
+            print(f"[KVQDBG] L{layer_idx} after-append: packed={packed} bytes, scales={scales} bytes", flush=True)
+            print(_cuda_mem_snapshot(f"after-append L{layer_idx}"), flush=True)
 
 
     def dequant_slice(self, layer_idx: int, t_slice: slice) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -300,6 +318,12 @@ class PagedKVCacheQuantized:
         out_k: torch.Tensor, out_v: torch.Tensor
     ):
         """Dequantize [start:stop] directly into provided GPU scratch buffers."""
+        if self.debug:
+            start, stop, _ = t_slice.indices(self.layers[layer_idx].T)
+            Twant = stop - start
+            print(f"[KVQDBG] L{layer_idx} dequant-into: slice=[{start}:{stop}] (T={Twant}) -> out_k/out_v on {out_k.device}", flush=True)
+            print(_cuda_mem_snapshot(f"before-dequant L{layer_idx}"), flush=True)
+
         st = self.layers[layer_idx]
         start, stop, _ = t_slice.indices(st.T)
         T = stop - start
@@ -318,8 +342,29 @@ class PagedKVCacheQuantized:
         if out_v.shape != V.shape: out_v.resize_(V.shape)
         out_k.copy_(K, non_blocking=True)
         out_v.copy_(V, non_blocking=True)
-        return out_k, out_v
+        
+        if self.debug:
+            print(_cuda_mem_snapshot(f"after-dequant L{layer_idx}"), flush=True)
+            # show scratch sizes
+            print(f"[KVQDBG] L{layer_idx} scratch shapes: K{tuple(out_k.shape)} V{tuple(out_v.shape)}", flush=True)
+         return out_k, out_v
 
     # Simple metric helpers
     def bytes_summary(self) -> Dict[str, int]:
         return {"kv_bytes_total_packed": int(self.bytes_total), "kv_bytes_scales": int(self.bytes_scales)}
+
+
+def _cuda_mem_snapshot(tag: str):
+    """Return a compact GPU memory snapshot string."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return f"[{tag}] cuda not available"
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        alloc = torch.cuda.memory_allocated()
+        reserv = torch.cuda.memory_reserved()
+        return (f"[{tag}] free={free/2**20:.0f}MiB alloc={alloc/2**20:.0f}MiB "
+                f"reserved={reserv/2**20:.0f}MiB total={total/2**20:.0f}MiB")
+    except Exception as e:
+        return f"[{tag}] mem-snapshot-error: {e!r}"

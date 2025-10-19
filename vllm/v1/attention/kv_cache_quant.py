@@ -13,12 +13,11 @@ def _amax_channelwise(x: torch.Tensor, dim: int) -> torch.Tensor:
     # amax along specified dim (keepdim=True for broadcasting)
     return x.abs().amax(dim=dim, keepdim=True).clamp_min_(1e-8)
 
-def _quantize_symmetric(x: torch.Tensor, bits: int, group_size: int, granularity: str) -> Tuple[torch.Tensor, torch.Tensor]:
+def _quantize_symmetric(x: torch.Tensor, bits: int, group_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize x with symmetric per-channel(group) or per-token-head granularity.
-    Returns (q_packed, scale). For 8-bit: int8 tensor; for 4/2-bit: uint8 packed.
-    Layout assumption:
-      x shape: [T, H, D] (token, head, head_dim)
+    Symmetric per-channel(grouped) quantization (time-invariant scales).
+    Returns (q_packed, scale). For 8-bit: int8; for 4/2-bit: uint8 packed.
+    x: [T,H,D]
     """
     assert x.dim() == 3, "Expected [T, H, D]"
     T, H, D = x.shape
@@ -32,96 +31,47 @@ def _quantize_symmetric(x: torch.Tensor, bits: int, group_size: int, granularity
     else:
         raise ValueError(f"Unsupported bits={bits}")
 
-    if granularity == "per_token_head":
-        # scale shape: [T, H, ceil(D/group)]
-        if D % group_size != 0:
-            # pad D to multiple of group_size for scale computation; pad with zeros
-            pad = group_size - (D % group_size)
-            x_pad = torch.nn.functional.pad(x, (0, pad))
-            Dp = x_pad.shape[-1]
-        else:
-            x_pad = x
-            Dp = D
-        G = Dp // group_size
-        x_view = x_pad.view(T, H, G, group_size)
-        # scale per group
-        scale = _amax_channelwise(x_view, dim=-1) / levels  # [T,H,G,1]
-        scale = scale.squeeze(-1)                             # [T,H,G]
-        # quantize
-        q = (x_pad.view(T, H, G, group_size) / scale.unsqueeze(-1)).round()
-        if bits == 8:
-            q = q.clamp_(-128, 127).to(torch.int8).view(T, H, Dp)
-            return q[..., :D].contiguous(), scale
-        elif bits == 4:
-            q = q.clamp_(-8, 7).to(torch.int8)  # store as signed nibble before pack
-            return _pack_nibble_signed(q.view(T, H, Dp))[..., : (D // 2)], scale
-        else:
-            q = q.clamp_(-2, 1).to(torch.int8)  # store as 2-bit signed before pack
-            return _pack_2bit_signed(q.view(T, H, Dp))[..., : (D // 4)], scale
+    # pad D to multiple of group_size if needed
+    if D % group_size != 0:
+        pad = group_size - (D % group_size)
+        x_pad = torch.nn.functional.pad(x, (0, pad))
+        Dp = x_pad.shape[-1]
     else:
-        # per_channel(group) over D only (shared across tokens)
-        if D % group_size != 0:
-            pad = group_size - (D % group_size)
-            x_pad = torch.nn.functional.pad(x, (0, pad))
-            Dp = x_pad.shape[-1]
-        else:
-            x_pad = x
-            Dp = D
-        G = Dp // group_size
-        # compute scale across T dimension as well to be safe (amax over T)
-        x_view = x_pad.view(T, H, G, group_size)
-        amax = x_view.abs().amax(dim=(0, 2, 3), keepdim=False)  # [H]
-        # use per-head global amax for stability; could be per (H, G) optionally
-        # switch to (H, G)
-        amax_hg = x_view.abs().amax(dim=(0, 3)).amax(dim=0)     # [H,G]
-        scale = (amax_hg / levels).clamp_min(1e-8)              # [H,G]
-        # quantize
-        q = (x_pad.view(T, H, G, group_size) / scale.unsqueeze(0).unsqueeze(-1)).round()
-        if bits == 8:
-            q = q.clamp_(-128, 127).to(torch.int8).view(T, H, Dp)
-            return q[..., :D].contiguous(), scale
-        elif bits == 4:
-            q = q.clamp_(-8, 7).to(torch.int8)
-            return _pack_nibble_signed(q.view(T, H, Dp))[..., : (D // 2)], scale
-        else:
-            q = q.clamp_(-2, 1).to(torch.int8)
-            return _pack_2bit_signed(q.view(T, H, Dp))[..., : (D // 4)], scale
+        x_pad = x
+        Dp = D
+    G = Dp // group_size
 
-def _dequantize_symmetric(q, scale, bits: int, group_size: int, granularity: str, T: int, H: int, D: int) -> torch.Tensor:
-    """Undo _quantize_symmetric. Returns fp16 tensor [T,H,D]."""
+    # scale per (H,G), reduced over time & group
+    x_view = x_pad.view(T, H, G, group_size)
+    amax_hg = x_view.abs().amax(dim=(0, 3)).amax(dim=0)     # [H,G]
+    scale = (amax_hg / levels).clamp_min(1e-8)              # [H,G]
+
+    # quantize
+    q = (x_pad.view(T, H, G, group_size) / scale.unsqueeze(0).unsqueeze(-1)).round()
+    if bits == 8:
+        q = q.clamp_(-128, 127).to(torch.int8).view(T, H, Dp)
+        return q[..., :D].contiguous(), scale.contiguous()
+    elif bits == 4:
+        q = q.clamp_(-8, 7).to(torch.int8)
+        return _pack_nibble_signed(q.view(T, H, Dp))[..., : (D // 2)], scale.contiguous()
+    else:
+        q = q.clamp_(-2, 1).to(torch.int8)
+        return _pack_2bit_signed(q.view(T, H, Dp))[..., : (D // 4)], scale.contiguous()
+
+def _dequantize_symmetric(q, scale, bits: int, group_size: int, T: int, H: int, D: int) -> torch.Tensor:
+    """Inverse of per-channel(grouped) symmetric quantization. Returns fp16 [T,H,D]."""
     if bits == 8:
         xq = q.to(torch.float32)
-        if granularity == "per_token_head":
-            # scale: [T,H,G], expand to [T,H,G,group]
-            Dp = ( (D + group_size - 1) // group_size ) * group_size
-            G = Dp // group_size
-            xq = torch.nn.functional.pad(xq, (0, Dp - D)).view(T, H, G, group_size)
-            x = xq * scale.unsqueeze(-1)
-            return x.view(T, H, Dp)[..., :D].to(torch.float16).contiguous()
-        else:
-            Dp = ( (D + group_size - 1) // group_size ) * group_size
-            G = Dp // group_size
-            xq = torch.nn.functional.pad(xq, (0, Dp - D)).view(T, H, G, group_size)
-            x = xq * scale.unsqueeze(0).unsqueeze(-1)
-            return x.view(T, H, Dp)[..., :D].to(torch.float16).contiguous()
     elif bits == 4:
-        # unpack to signed int4 in [-8,7]
         xq = _unpack_nibble_signed(q, T, H, D)  # float32
     else:
         xq = _unpack_2bit_signed(q, T, H, D)    # float32
 
-    if granularity == "per_token_head":
-        Dp = ( (D + group_size - 1) // group_size ) * group_size
-        G = Dp // group_size
-        xq = torch.nn.functional.pad(xq, (0, Dp - D)).view(T, H, G, group_size)
-        x = xq * scale.unsqueeze(-1)
-        return x.view(T, H, Dp)[..., :D].to(torch.float16).contiguous()
-    else:
-        Dp = ( (D + group_size - 1) // group_size ) * group_size
-        G = Dp // group_size
-        xq = torch.nn.functional.pad(xq, (0, Dp - D)).view(T, H, G, group_size)
-        x = xq * scale.unsqueeze(0).unsqueeze(-1)
-        return x.view(T, H, Dp)[..., :D].to(torch.float16).contiguous()
+    Dp = ((D + group_size - 1) // group_size) * group_size
+    G  = Dp // group_size
+    xq = torch.nn.functional.pad(xq, (0, Dp - D)).view(T, H, G, group_size)
+    x  = xq * scale.view(1, H, G, 1).to(torch.float16)      # time-invariant scales
+    return x.view(T, H, Dp)[..., :D].to(torch.float16).contiguous()
 
 def _asym_qparams(x: torch.Tensor, bits: int, reduce_over_time: bool, group_size: int):
     """
@@ -388,7 +338,6 @@ class PagedKVCacheQuantized:
                 bits_k=p.bits_k,
                 bits_v=p.bits_v,
                 group_size=p.group_size,
-                granularity=p.granularity,
                 mode_k=getattr(p, "mode_k", "asymmetric_channel"),
                 mode_v=getattr(p, "mode_v", "asymmetric_token"),
             )
@@ -398,75 +347,15 @@ class PagedKVCacheQuantized:
         return q, scale
 
     def append_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
-        """Append one step of K,V: shapes [H,D] (single token) or [T,H,D]."""
-        # === DEBUG: before-append snapshot ===
-        if self.debug and (self.layers[layer_idx].T == 0):
-            print(f"[KVQDBG] L{layer_idx} first-append: K/V shape={tuple(k.shape)} device={k.device} dtype={k.dtype}", flush=True)
-            print(_cuda_mem_snapshot(f"before-append L{layer_idx}"), flush=True)
-        elif self.debug and (self.layers[layer_idx].T % self.debug_interval == 0):
-            print(f"[KVQDBG] L{layer_idx} append@T={self.layers[layer_idx].T}: incoming {tuple(k.shape)}", flush=True)
-
+        """Append one step of K,V: accepts [H,D] or [T,H,D]; always uses _append_core."""
         st = self.layers[layer_idx]
-        assert k.shape == v.shape and k.dim() in (2,3)
-        # normalize to [T,H,D]
         if k.dim() == 2:
             k = k.unsqueeze(0)
             v = v.unsqueeze(0)
-
-        T, H, D = k.shape
-        st.H = H; st.D = D
-
-        # Quantize K
-        qk, sk = _quantize_symmetric(k, st.bits_k, st.group_size, st.granularity)
-        qv, sv = _quantize_symmetric(v, st.bits_v, st.group_size, st.granularity)
-
-        # Append along T
-        def _cat(old, new):
-            if old is None:
-                return new.contiguous()
-            return torch.cat([old, new], dim=0).contiguous()
-
-        st.K_packed = _cat(st.K_packed, qk)
-        st.V_packed = _cat(st.V_packed, qv)
-        st.K_scale = _cat(st.K_scale, sk) if st.granularity == "per_token_head" else sk
-        first_append = (st.T == 0)
-        st.V_scale = _cat(st.V_scale, sv) if st.granularity == "per_token_head" else sv
-        st.T += T
-
-        # book-keep bytes
-        self.bytes_total += int(qk.element_size() * qk.numel())
-        self.bytes_total += int(qv.element_size() * qv.numel())
-
-        # scales bytes        
-        if st.granularity == "per_token_head":
-            self.bytes_scales += int(sk.element_size() * sk.numel())
-            self.bytes_scales += int(sv.element_size() * sv.numel())
-        else:
-            if first_append:
-                self.bytes_scales += int(sk.element_size() * sk.numel())
-                self.bytes_scales += int(sv.element_size() * sv.numel())
-
-        # per-layer cumulative snapshot
-        if hasattr(self, "logger") and self.logger:
-            k_bytes = int(st.K_packed.element_size() * st.K_packed.numel()) if st.K_packed is not None else 0
-            v_bytes = int(st.V_packed.element_size() * st.V_packed.numel()) if st.V_packed is not None else 0
-            ks_bytes = int(st.K_scale.element_size() * st.K_scale.numel()) if st.K_scale is not None else 0
-            vs_bytes = int(st.V_scale.element_size() * st.V_scale.numel()) if st.V_scale is not None else 0
-            self.logger.log_layer(KVQuantLayerRecord(
-                layer=layer_idx,
-                bits_k=st.bits_k,
-                bits_v=st.bits_v,
-                kv_bytes_total_packed=k_bytes + v_bytes,
-                kv_bytes_scales=ks_bytes + vs_bytes,
-                tt=0.0,
-            ))
-        
-        # === DEBUG: after-append snapshot ===
+        if self.debug and (st.T == 0 or st.T % self.debug_interval == 0):
+            print(f"[KVQDBG] L{layer_idx} append@T={st.T}: incoming {tuple(k.shape)}", flush=True)
+        self._append_core(layer_idx, k.contiguous(), v.contiguous())
         if self.debug:
-            bs = self.bytes_summary()
-            packed = bs.get("kv_bytes_total_packed", 0)
-            scales = bs.get("kv_bytes_scales", 0)
-            print(f"[KVQDBG] L{layer_idx} after-append: packed={packed} bytes, scales={scales} bytes", flush=True)
             print(_cuda_mem_snapshot(f"after-append L{layer_idx}"), flush=True)
 
     def append_kv_prefill(self, layer_idx: int, K: torch.Tensor, V: torch.Tensor) -> None:
@@ -506,21 +395,21 @@ class PagedKVCacheQuantized:
             st.H, st.D = int(H_in), int(D_in)
 
         # ==== K: choose quant path ====
-        if getattr(st, "mode_k") == "asymmetric_channel":
+        if getattr(st, "mode_k", "symmetric") == "asymmetric_channel":
             qk, sk, zpk = _quantize_asymmetric(K, bits=st.bits_k, group_size=st.group_size, mode="asymmetric_channel")
-        elif getattr(st, "mode_k") == "asymmetric_token":
+        elif getattr(st, "mode_k", "symmetric") == "asymmetric_token":
             qk, sk, zpk = _quantize_asymmetric(K, bits=st.bits_k, group_size=st.group_size, mode="asymmetric_token")
         else:
-            qk, sk = _quantize_symmetric(K, bits=st.bits_k, group_size=st.group_size, granularity=st.granularity)
+            qk, sk = _quantize_symmetric(K, bits=st.bits_k, group_size=st.group_size)
             zpk = None
 
         # ==== V: choose quant path ====
-        if getattr(st, "mode_v") == "asymmetric_token":
+        if getattr(st, "mode_v", "symmetric") == "asymmetric_token":
             qv, sv, zpv = _quantize_asymmetric(V, bits=st.bits_v, group_size=st.group_size, mode="asymmetric_token")
-        elif getattr(st, "mode_v") == "asymmetric_channel":
+        elif getattr(st, "mode_v", "symmetric") == "asymmetric_channel":
             qv, sv, zpv = _quantize_asymmetric(V, bits=st.bits_v, group_size=st.group_size, mode="asymmetric_channel")
         else:
-            qv, sv = _quantize_symmetric(V, bits=st.bits_v, group_size=st.group_size, granularity=st.granularity)
+            qv, sv = _quantize_symmetric(V, bits=st.bits_v, group_size=st.group_size)
             zpv = None
 
         def _cat0(old, new):
@@ -548,23 +437,17 @@ class PagedKVCacheQuantized:
 
         # K
         if zpk is None:
-            # symmetric path uses existing logic: granularity decides append vs set-once
-            if st.granularity == "per_token_head":
-                st.K_scale = _cat0(st.K_scale, sk)
-            else:
-                if st.K_scale is None or (isinstance(st.K_scale, torch.Tensor) and st.K_scale.numel() == 0):
-                    st.K_scale = sk.contiguous()
+            # symmetric(per-channel only): scale is time-invariant → set once
+            if st.K_scale is None or (isinstance(st.K_scale, torch.Tensor) and st.K_scale.numel() == 0):
+                st.K_scale = sk.contiguous()
         else:
             per_token = (st.mode_k == "asymmetric_token")
             st.K_scale, st.K_zp = _append_scale_zp(st.K_scale, st.K_zp, sk, zpk, per_token)
 
         # V
         if zpv is None:
-            if st.granularity == "per_token_head":
-                st.V_scale = _cat0(st.V_scale, sv)
-            else:
-                if st.V_scale is None or (isinstance(st.V_scale, torch.Tensor) and st.V_scale.numel() == 0):
-                    st.V_scale = sv.contiguous()
+            if st.V_scale is None or (isinstance(st.V_scale, torch.Tensor) and st.V_scale.numel() == 0):
+                st.V_scale = sv.contiguous()
         else:
             per_token = (st.mode_v == "asymmetric_token")
             st.V_scale, st.V_zp = _append_scale_zp(st.V_scale, st.V_zp, sv, zpv, per_token)
@@ -574,31 +457,34 @@ class PagedKVCacheQuantized:
 
         # ---- byte accounting (packed + scale + zp) ----
         self.bytes_total += int(qk.numel() * qk.element_size()) + int(qv.numel() * qv.element_size())
-        # scales
-        if zpk is None and st.granularity == "per_token_head":
-            self.bytes_scales += int(sk.numel() * sk.element_size())
-        elif zpk is None and st.granularity != "per_token_head":
-            if int(st.T) == T_new:  # first write
+
+        # K scales/zp
+        if zpk is None:
+            # symmetric per-channel: count once on first write into empty store
+            if int(st.T) == T_new:
                 self.bytes_scales += int(sk.numel() * sk.element_size())
         else:
-            # asymmetric: decide per-token vs per-channel
             if st.mode_k == "asymmetric_token":
-                self.bytes_scales += int(sk.numel() * sk.element_size()); self.bytes_zp += int(zpk.numel())
+                self.bytes_scales += int(sk.numel() * sk.element_size())
+                self.bytes_zp     += int(zpk.numel())
             else:
-                if int(st.T) == T_new:  # first write
-                    self.bytes_scales += int(sk.numel() * sk.element_size()); self.bytes_zp += int(zpk.numel())
+                if int(st.T) == T_new:
+                    self.bytes_scales += int(sk.numel() * sk.element_size())
+                    self.bytes_zp     += int(zpk.numel())
 
-        if zpv is None and st.granularity == "per_token_head":
-            self.bytes_scales += int(sv.numel() * sv.element_size())
-        elif zpv is None and st.granularity != "per_token_head":
+        # V scales/zp
+        if zpv is None:
             if int(st.T) == T_new:
                 self.bytes_scales += int(sv.numel() * sv.element_size())
         else:
             if st.mode_v == "asymmetric_token":
-                self.bytes_scales += int(sv.numel() * sv.element_size()); self.bytes_zp += int(zpv.numel())
+                self.bytes_scales += int(sv.numel() * sv.element_size())
+                self.bytes_zp     += int(zpv.numel())
             else:
                 if int(st.T) == T_new:
-                    self.bytes_scales += int(sv.numel() * sv.element_size()); self.bytes_zp += int(zpv.numel())
+                    self.bytes_scales += int(sv.numel() * sv.element_size())
+                    self.bytes_zp     += int(zpv.numel())
+        
 
         if getattr(self, "debug", False):
             add_bytes = (qk.numel()*qk.element_size() + qv.numel()*qv.element_size())
@@ -618,13 +504,13 @@ class PagedKVCacheQuantized:
             if st.mode_k == "asymmetric_token":
                 Ks = st.K_scale[start:stop]; Kzp = st.K_zp[start:stop]
             else:
-                Ks = st.K_scale;            Kzp = st.K_zp
+                Ks = st.K_scale; Kzp = st.K_zp
             K = _dequantize_asymmetric(Kp, Ks, Kzp, bits=st.bits_k, group_size=st.group_size,
                                     mode=st.mode_k, T=T, H=st.H, D=st.D)
         else:
-            Ks = st.K_scale if st.granularity != "per_token_head" else st.K_scale[start:stop]
-            K  = _dequantize_symmetric(Kp, Ks, st.bits_k, st.group_size, st.granularity,
-                                    T=T, H=st.H, D=st.D)
+            Ks = st.K_scale
+            K  = _dequantize_symmetric(Kp, Ks, bits=st.bits_k, group_size=st.group_size,
+                               T=T, H=st.H, D=st.D)
 
         # ---- V ----
         Vp = st.V_packed[start:stop]
@@ -632,13 +518,13 @@ class PagedKVCacheQuantized:
             if st.mode_v == "asymmetric_token":
                 Vs = st.V_scale[start:stop]; Vzp = st.V_zp[start:stop]
             else:
-                Vs = st.V_scale;            Vzp = st.V_zp
+                Vs = st.V_scale; Vzp = st.V_zp
             V = _dequantize_asymmetric(Vp, Vs, Vzp, bits=st.bits_v, group_size=st.group_size,
                                     mode=st.mode_v, T=T, H=st.H, D=st.D)
         else:
-            Vs = st.V_scale if st.granularity != "per_token_head" else st.V_scale[start:stop]
-            V  = _dequantize_symmetric(Vp, Vs, st.bits_v, st.group_size, st.granularity,
-                                    T=T, H=st.H, D=st.D)
+            Vs = st.V_scale
+            V  = _dequantize_symmetric(Vp, Vs, bits=st.bits_v, group_size=st.group_size,
+                               T=T, H=st.H, D=st.D)
 
         return K, V
 

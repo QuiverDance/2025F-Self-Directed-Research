@@ -26,7 +26,8 @@ class LayerPolicy:
     bits_v: int
     granularity: str = "per_channel"      # "per_channel" (grouped), "per_token_head" (expensive)
     group_size: int = 64
-    symmetric: bool = True
+    mode_k: str = "asymmetric_channel"
+    mode_v: str = "asymmetric_token"
 
 @dataclass
 class KVQuantConfig:

@@ -525,9 +525,9 @@ class PagedKVCacheQuantized:
             zpv = None
 
         def _cat0(old, new):
-        if old is None or (isinstance(old, torch.Tensor) and old.numel() == 0):
-            return new.contiguous()
-        return torch.cat([old, new], dim=0).contiguous()
+            if old is None or (isinstance(old, torch.Tensor) and old.numel() == 0):
+                return new.contiguous()
+            return torch.cat([old, new], dim=0).contiguous()
 
         # ---- append packed ----
         st.K_packed = _cat0(st.K_packed, qk)

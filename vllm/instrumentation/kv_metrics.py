@@ -301,9 +301,16 @@ class KVMetricsCollector:
         cpu_b = _get_attr_any(mgr, ["cpu_bytes", "cpu_used_bytes", "host_bytes", "offload_bytes"]) if mgr else None
         if isinstance(gpu_b, int) or isinstance(cpu_b, int):
             g = int(gpu_b or 0); c = int(cpu_b or 0)
-            out = {"total": g + c, "gpu": g, "cpu": c}
-            _kvdbg("snapshot.direct", out)
             return {"total": g + c, "gpu": g, "cpu": c}
+
+        # 1.b) Direct quantized KV byte counters (if using KV quantization)
+        kvq = getattr(self, "_kvq_ref", None) or getattr(eng, "kv_quant", None)
+        if kvq is not None:
+            try:
+                q_bytes = _estimate_quant_kv_bytes_blockwise(eng)
+                return {"total": q_bytes, "gpu": q_bytes, "cpu": 0}
+            except Exception:
+                pass
 
         # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
         block_bytes = _infer_block_bytes(eng)
@@ -961,7 +968,79 @@ def _get_used_blocks(mgr: Any, device: str) -> int:
     _kvdbg(f"used_blocks[{dev}]", "unsupported device")
     return 0
 
+def _get_block_size(engine) -> int:
+    # Try common locations used by vLLM 0.10.x
+    for attr in ("cache_config", "kv_cache_config"):
+        obj = getattr(engine, attr, None)
+        if obj is not None and hasattr(obj, "block_size"):
+            return int(obj.block_size)
+    bm = getattr(engine, "block_manager", None)
+    if bm is not None and hasattr(bm, "block_size"):
+        return int(bm.block_size)
+    # Fallback: vLLM default is typically 16
+    return 16
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+def _packed_D(D: int, bits: int) -> int:
+    if bits == 8:  return D
+    if bits == 4:  return D // 2   # our packer uses exact D//2
+    if bits == 2:  return D // 4
+    raise ValueError(f"Unsupported bits={bits}")
+
+def _scale_bytes_one_layer(st, tokens: int) -> int:
+    """Return scale bytes for one layer, given token count.
+       - per_channel: time-invariant (count once per layer if tokens>0)
+       - per_token_head: scales per token
+    """
+    H = int(st.H)
+    D = int(st.D)
+    if H <= 0 or D <= 0 or tokens <= 0:
+        return 0
+    G = int(getattr(st, "group_size", 64) or 64)
+    groups = _ceil_div(D, G)
+    scale_size = 4  # float32 scales in our impl
+    per_token = H * groups * scale_size * 2  # K + V
+    if getattr(st, "granularity", "per_channel") == "per_token_head":
+        # time-variant: per token
+        return tokens * per_token
+    else:
+        # time-invariant: once per layer
+        return per_token
+
+def _estimate_quant_kv_bytes_blockwise(engine) -> int:
+    """Block-rounded resident bytes for quantized KV:
+       sum_layers( ceil(T/B) * B * H * (packed_D_k + packed_D_v) ) + scale bytes
+    """
+    kvq = getattr(engine, "kv_quant", None)
+    if kvq is None:
+        return 0
+    B = _get_block_size(engine)
+
+    total_packed = 0
+    total_scales = 0
+    layers = getattr(kvq, "layers", [])
+    for st in layers:
+        H = int(st.H); D = int(st.D); T = int(st.T)
+        if H <= 0 or D <= 0 or T <= 0:
+            continue
+        blocks = _ceil_div(T, B)
+        # packed bytes per block (int8 elements)
+        pd_k = _packed_D(D, int(st.bits_k))
+        pd_v = _packed_D(D, int(st.bits_v))
+        bytes_per_block = B * H * (pd_k + pd_v)  # int8 = 1B per element
+        total_packed += blocks * bytes_per_block
+
+        # scales
+        # per_token_head: blocks*B tokens (block-rounded)
+        # per_channel   : once per layer if T>0
+        if getattr(st, "granularity", "per_channel") == "per_token_head":
+            total_scales += _scale_bytes_one_layer(st, tokens=blocks * B)
+        else:
+            total_scales += _scale_bytes_one_layer(st, tokens=T)
+
+    return int(total_packed + total_scales)
 
 def _kvdbg(tag: str, payload=None):
     return

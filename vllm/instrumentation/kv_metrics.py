@@ -304,13 +304,15 @@ class KVMetricsCollector:
             return {"total": g + c, "gpu": g, "cpu": c}
 
         # 1.b) Direct quantized KV byte counters (if using KV quantization)
-        kvq = getattr(self, "_kvq_ref", None) or getattr(eng, "kv_quant", None)
-        if kvq is not None:
-            try:
-                q_bytes = _estimate_quant_kv_bytes_blockwise(eng)
+        try:
+            kvq = getattr(self, "_kvq_ref", None)
+            if kvq is None:
+                kvq = _get_kvq_from_engine(eng)
+            if kvq is not None and hasattr(kvq, "layers"):
+                q_bytes = _estimate_quant_kv_bytes_blockwise(eng, kvq)
                 return {"total": q_bytes, "gpu": q_bytes, "cpu": 0}
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # 2) Fallback: used_blocks × bytes_per_block (works with BlockPool)
         block_bytes = _infer_block_bytes(eng)
@@ -390,31 +392,10 @@ class KVMetricsCollector:
                 setattr(rec, f"kv_token_bytes_est_at_{phase}", int(est_token_bytes))
                 setattr(rec, key_packed, qpacked)
 
-            # --- per-request peak update (total/gpu/cpu) ---
-            prev_total = int(getattr(rec, "kv_bytes_total_peak_alloc", 0) or 0)
-            prev_gpu   = int(getattr(rec, "kv_bytes_gpu_peak_alloc",   0) or 0)
-            prev_cpu   = int(getattr(rec, "kv_bytes_cpu_peak_alloc",   0) or 0)
-
-            new_total = max(prev_total, total)
-            new_gpu   = max(prev_gpu,   gpu)
-            new_cpu   = max(prev_cpu,   cpu)
-
-            if isinstance(rec, dict):
-                rec["kv_bytes_total_peak_alloc"] = new_total
-                rec["kv_bytes_gpu_peak_alloc"]   = new_gpu
-                rec["kv_bytes_cpu_peak_alloc"]   = new_cpu
-            else:
-                rec.kv_bytes_total_peak_alloc = new_total
-                rec.kv_bytes_gpu_peak_alloc   = new_gpu
-                rec.kv_bytes_cpu_peak_alloc   = new_cpu
-
-            # --- run-level peak for summary (use attribute, not dict) ---
-            if self._agg is not None:
-                try:
-                    if new_total > int(getattr(self._agg, "peak_kv_total", 0) or 0):
-                        self._agg.peak_kv_total = new_total
-                except Exception:
-                    pass
+            try:
+                self.bump_peak_alloc(request_id)
+            except Exception:
+                pass
 
             _kvdbg("snapshot_kv.write", {
                 "rid": request_id, "phase": phase,
@@ -1027,14 +1008,15 @@ def _scale_bytes_one_layer(st, tokens: int) -> int:
         # time-invariant: once per layer
         return per_token
 
-def _estimate_quant_kv_bytes_blockwise(engine) -> int:
+def _estimate_quant_kv_bytes_blockwise(engine, kvq) -> int:
     """Block-rounded resident bytes for quantized KV:
        sum_layers( ceil(T/B) * B * H * (packed_D_k + packed_D_v) ) + scale bytes
     """
-    kvq = getattr(engine, "kv_quant", None)
-    if kvq is None:
-        return 0
-    B = _get_block_size(engine)
+    try:
+        B, _, _ = _est_bytes_from_tokens(eng, 0, 0)  # 첫 리턴값이 block_size
+    except Exception:
+        # 안전망: 엔진에서 못 얻으면 16으로
+        B = 16
 
     total_packed = 0
     total_scales = 0

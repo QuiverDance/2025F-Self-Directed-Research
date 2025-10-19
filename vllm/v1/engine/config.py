@@ -24,9 +24,8 @@ def _expand_layers_key(key: str) -> List[int]:
 class LayerPolicy:
     bits_k: int
     bits_v: int
-    granularity: str = "per_channel"      # "per_channel" (grouped), "per_token_head" (expensive)
     group_size: int = 64
-    mode_k: str = "asymmetric_channel"
+    mode_k: str = "asymmetric_channel" # "symmetric" | "asymmetric_channel" | "asymmetric_token"
     mode_v: str = "asymmetric_token"
 
 @dataclass

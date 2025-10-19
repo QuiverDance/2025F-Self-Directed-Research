@@ -350,7 +350,6 @@ class LayerKVStore:
     bits_k: int
     bits_v: int
     group_size: int
-    granularity: str
     mode_k: str = "symmetric"
     mode_v: str = "symmetric"
     # packed storage and scales

@@ -74,7 +74,7 @@ class KVQuantConfig:
                 mode_k = str(pol.get("mode_k", default_policy.mode_k))
                 mode_v = str(pol.get("mode_v", default_policy.mode_v))
                 for li in _expand_layers_key(spec):
-                    per_layer[li] = LayerPolicy(bits_k, bits_v, gran, gsz, sym)
+                    per_layer[li] = LayerPolicy(bits_k, bits_v, gsz, mode_k, mode_v)
 
         # validate bits
         if enable:

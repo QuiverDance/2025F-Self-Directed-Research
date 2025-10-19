@@ -390,13 +390,31 @@ class KVMetricsCollector:
                 setattr(rec, f"kv_token_bytes_est_at_{phase}", int(est_token_bytes))
                 setattr(rec, key_packed, qpacked)
 
-            # Maintain peak for summary
-            try:
-                prev_peak = int(self._agg.get("peak_kv_bytes_total", 0))
-                if total > prev_peak:
-                    self._agg["peak_kv_bytes_total"] = total
-            except Exception:
-                pass
+            # --- per-request peak update (total/gpu/cpu) ---
+            prev_total = int(getattr(rec, "kv_bytes_total_peak_alloc", 0) or 0)
+            prev_gpu   = int(getattr(rec, "kv_bytes_gpu_peak_alloc",   0) or 0)
+            prev_cpu   = int(getattr(rec, "kv_bytes_cpu_peak_alloc",   0) or 0)
+
+            new_total = max(prev_total, total)
+            new_gpu   = max(prev_gpu,   gpu)
+            new_cpu   = max(prev_cpu,   cpu)
+
+            if isinstance(rec, dict):
+                rec["kv_bytes_total_peak_alloc"] = new_total
+                rec["kv_bytes_gpu_peak_alloc"]   = new_gpu
+                rec["kv_bytes_cpu_peak_alloc"]   = new_cpu
+            else:
+                rec.kv_bytes_total_peak_alloc = new_total
+                rec.kv_bytes_gpu_peak_alloc   = new_gpu
+                rec.kv_bytes_cpu_peak_alloc   = new_cpu
+
+            # --- run-level peak for summary (use attribute, not dict) ---
+            if self._agg is not None:
+                try:
+                    if new_total > int(getattr(self._agg, "peak_kv_total", 0) or 0):
+                        self._agg.peak_kv_total = new_total
+                except Exception:
+                    pass
 
             _kvdbg("snapshot_kv.write", {
                 "rid": request_id, "phase": phase,

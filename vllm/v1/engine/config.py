@@ -6,7 +6,7 @@ import json
 import re
 
 _VALID_BITS = {2, 4, 8}
-_DEFAULT_POLICY = {"K": 8, "V": 8, "granularity": "per_channel", "group_size": 64, "symmetric": True}
+_DEFAULT_POLICY = {"K": 8, "V": 8, "group_size": 64, "mode_k": "asymmetric_channel", "mode_v": "asymmetric_token"}
 
 def _expand_layers_key(key: str) -> List[int]:
     """Parse layer range string like '0-3,6,8-10' into indices."""
@@ -38,9 +38,9 @@ class KVQuantConfig:
     default_policy: LayerPolicy = field(default_factory=lambda: LayerPolicy(
         bits_k=_DEFAULT_POLICY["K"],
         bits_v=_DEFAULT_POLICY["V"],
-        granularity=_DEFAULT_POLICY["granularity"],
         group_size=_DEFAULT_POLICY["group_size"],
-        symmetric=_DEFAULT_POLICY["symmetric"],
+        mode_k=_DEFAULT_POLICY["mode_k"],
+        mode_v=_DEFAULT_POLICY["mode_v"],
     ))
     per_layer: Dict[int, LayerPolicy] = field(default_factory=dict)
 
@@ -62,17 +62,17 @@ class KVQuantConfig:
             base = {**_DEFAULT_POLICY, **(raw.get("default", {}))}
             default_policy = LayerPolicy(
                 bits_k=int(base.get("K", 8)), bits_v=int(base.get("V", 8)),
-                granularity=str(base.get("granularity", "per_channel")),
                 group_size=int(base.get("group_size", 64)),
-                symmetric=bool(base.get("symmetric", True)),
+                mode_k=str(base.get("mode_k", "asymmetric_channel")),
+                mode_v=str(base.get("mode_v", "asymmetric_token")),
             )
             layers = raw.get("layers", {})
             for spec, pol in layers.items():
                 bits_k = int(pol.get("K", default_policy.bits_k))
                 bits_v = int(pol.get("V", default_policy.bits_v))
-                gran = str(pol.get("granularity", default_policy.granularity))
                 gsz = int(pol.get("group_size", default_policy.group_size))
-                sym = bool(pol.get("symmetric", default_policy.symmetric))
+                mode_k = str(pol.get("mode_k", default_policy.mode_k))
+                mode_v = str(pol.get("mode_v", default_policy.mode_v))
                 for li in _expand_layers_key(spec):
                     per_layer[li] = LayerPolicy(bits_k, bits_v, gran, gsz, sym)
 

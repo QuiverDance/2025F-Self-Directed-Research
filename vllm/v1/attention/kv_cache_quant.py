@@ -9,6 +9,12 @@ from vllm.v1.metrics.kv_quant import KVQuantLayerRecord
 # Helpers for (de)quant
 # -------------------------
 T_TILE = 256  # T-tiling for memory-safe quantization
+_KVQ_ACTIVE_EPOCH = 0
+
+def kvq_new_task():
+    """Call before starting a new REQUEST: bump global epoch to signal cache reset."""
+    global _KVQ_ACTIVE_EPOCH
+    _KVQ_ACTIVE_EPOCH += 1
 
 def _cuda_free_bytes(device="cuda"):
     import torch
@@ -468,13 +474,17 @@ class PagedKVCacheQuantized:
     Replace with paged allocator bindings for production.
     """
 
-    def __init__(self, n_layers: int, policies, device: torch.device, debug: bool = False, debug_interval: int = 128):
+    def __init__(self, n_layers: int, policies, device: torch.device, 
+    debug: bool = False, debug_interval: int = 128, auto_reset_on_dup_prefill: bool = True):
         self.device = device
         self.layers: Dict[int, LayerKVStore] = {}
         self.policies = policies  # callable: layer_idx -> LayerPolicy
 
         self.lowmem_guard_bytes = 768 << 20   # 768 MiB threshold
         self.min_t_tile         = 64          # TILE under limit
+
+        self._epoch_seen = -1
+        self.auto_reset_on_dup_prefill = auto_reset_on_dup_prefill
 
         # stats
         self.bytes_total = 0
@@ -498,6 +508,21 @@ class PagedKVCacheQuantized:
     def _pack_bits(bits: int, q: torch.Tensor, scale: torch.Tensor, is_k: bool, D: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return q, scale
 
+    def reset_all(self, reason: str = ""):
+        for st in self.layers:
+            for attr in ("K_packed", "V_packed", "scale_k", "scale_v"):
+                if hasattr(st, attr) and getattr(st, attr) is not None:
+                    setattr(st, attr, None)
+            st.T = 0
+            st.H = 0
+            st.D = 0
+        try:
+            import torch
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
     def append_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
         """Append one step of K,V: accepts [H,D] or [T,H,D]; always uses _append_core."""
         st = self.layers[layer_idx]
@@ -514,6 +539,22 @@ class PagedKVCacheQuantized:
         """
         Append-only for prefill phase with padding-aware effective length.
         """
+        # If global epoch changed, reset all layers
+        global _KVQ_ACTIVE_EPOCH
+        if self._epoch_seen != _KVQ_ACTIVE_EPOCH:
+            self.reset_all(reason=f"new_task(epoch={_KVQ_ACTIVE_EPOCH})")
+            self._epoch_seen = _KVQ_ACTIVE_EPOCH
+
+        # 2) '중복 PREFILL' 자동 감지: [T,H,D]가 들어오는데, T가 이전과 같다면
+        # Duplicate PREFILL detection: if input K is [T,H,D] and T matches existing T,
+        # then likely re-PREFILLing the same length → reset and start over.
+        if k.dim() == 3:
+            T_in = k.shape[0]
+            st = self.layers[layer_idx]
+            if self.auto_reset_on_dup_prefill and st.T and T_in == st.T:
+                self.reset_all(reason=f"dup_prefill(T={T_in})")
+                self._epoch_seen = _KVQ_ACTIVE_EPOCH
+
         st = self.layers[layer_idx]
         T_in = int(K.shape[0])
         # approximate T_eff by checking trailing all-zero rows in K

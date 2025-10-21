@@ -10,6 +10,13 @@ from vllm.v1.metrics.kv_quant import KVQuantLayerRecord
 # -------------------------
 T_TILE = 256  # T-tiling for memory-safe quantization
 
+def _cuda_free_bytes(device="cuda"):
+    import torch
+    free, total = torch.cuda.mem_get_info()
+    return int(free)
+
+def _mb(x): return int(x) >> 20
+
 def _iter_covering(chunks, start: int, stop: int):
     """Yield (idx, off, take, dst) covering [start:stop) over a list of T-major chunks.
        dst: destination start index inside the requested slice buffer (0-based).
@@ -466,6 +473,9 @@ class PagedKVCacheQuantized:
         self.layers: Dict[int, LayerKVStore] = {}
         self.policies = policies  # callable: layer_idx -> LayerPolicy
 
+        self.lowmem_guard_bytes = 768 << 20   # 768 MiB threshold
+        self.min_t_tile         = 64          # TILE under limit
+
         # stats
         self.bytes_total = 0
         self.bytes_scales = 0
@@ -626,6 +636,7 @@ class PagedKVCacheQuantized:
             self.bytes_scales += int(st.V_scale.numel() * st.V_scale.element_size())
             self.bytes_zp     += int(st.V_zp.numel())
 
+        self._maybe_release_cuda_cache(f"PREFILL after-append L{layer_idx}")
         if getattr(self, "debug", False):
             add_bytes = (qk.numel()*qk.element_size() + qv.numel()*qv.element_size())
             print(f"[KVQDBG] L{layer_idx} append_chunked: +T={T_new} +packed={add_bytes}B (tot_packed={self.bytes_total}B)", flush=True)
@@ -693,6 +704,7 @@ class PagedKVCacheQuantized:
                                         mode="symmetric_channel", T=take, H=H, D=D)
             V_out[dst:dst+take].copy_(Vt, non_blocking=True)
 
+        self._maybe_release_cuda_cache(f"dequant_slice L{layer_idx} [{start}:{stop}]")
         return K_out, V_out
 
 

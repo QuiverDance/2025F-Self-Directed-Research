@@ -1,6 +1,6 @@
 # vllm/v1/attention/kv_cache_quant.py
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 import torch
 import math
@@ -9,6 +9,25 @@ from vllm.v1.metrics.kv_quant import KVQuantLayerRecord
 # Helpers for (de)quant
 # -------------------------
 T_TILE = 256  # T-tiling for memory-safe quantization
+
+def _iter_covering(chunks, start: int, stop: int):
+    """Yield (idx, off, take, dst) covering [start:stop) over a list of T-major chunks.
+       dst: destination start index inside the requested slice buffer (0-based).
+    """
+    t = 0
+    filled = 0
+    for i, ch in enumerate(chunks):
+        clen = int(ch.shape[0])
+        if t + clen <= start:
+            t += clen
+            continue
+        if t >= stop:
+            break
+        off  = max(0, start - t)
+        take = min(clen - off, stop - (t + off))
+        yield i, off, take, filled
+        filled += take
+        t += clen
 
 def _amax_channelwise(x: torch.Tensor, dim: int) -> torch.Tensor:
     # amax along specified dim (keepdim=True for broadcasting)
@@ -131,7 +150,7 @@ def _unpack_nibble_signed_i8(packed: torch.Tensor, T: int, H: int, D: int) -> to
     b = packed.view(T, H, -1)
     lo = (b & 0x0F).to(torch.int8) - 8
     hi = ((b >> 4) & 0x0F).to(torch.int8) - 8
-    out = torch.empty((T, H, (b.shape[-1] * 2)), dtype=torch.int8, device=packed.device)
+    out = torch.empty((T, H, b.shape[-1] * 2), dtype=torch.int8, device=packed.device)
     out[..., 0::2] = lo
     out[..., 1::2] = hi
     return out[..., :D].contiguous()
@@ -431,6 +450,10 @@ class LayerKVStore:
     T: int = 0
     H: int = 0
     D: int = 0
+    K_chunks: list[torch.Tensor] = field(default_factory=list)
+    V_chunks: list[torch.Tensor] = field(default_factory=list)
+    Ks_chunks: list[torch.Tensor] = field(default_factory=list)  # for per_token_head
+    Vs_chunks: list[torch.Tensor] = field(default_factory=list)  # for per_token_head
 
 class PagedKVCacheQuantized:
     """Reference quantized KV cache that packs K/V per layer with given policy.
@@ -501,8 +524,8 @@ class PagedKVCacheQuantized:
         self._append_core(layer_idx, K_use, V_use)
 
     def _append_core(self, layer_idx: int, K: torch.Tensor, V: torch.Tensor) -> None:
-        """Quantize & append K/V (time-axis) into per-layer packed storage."""
-        import torch
+        """Quantize & append K/V (time-axis) into per-layer packed storage (CHUNKED)."""
+        import torch, math
         st = self.layers[layer_idx]
 
         # --- validate & init H/D ---
@@ -513,176 +536,165 @@ class PagedKVCacheQuantized:
         else:
             st.H, st.D = int(H_in), int(D_in)
 
-        # ---- Quantize & pack (supports symmetric_channel | symmetric_token) ----
+        # ---- Quantize & pack ----
         # K
         mk = getattr(st, "mode_k", "symmetric_channel")
         if mk == "asymmetric_channel":
-            qk, sk, zpk = _quantize_asymmetric(K, bits=st.bits_k, group_size=st.group_size, mode="asymmetric_channel")
+            qk, sk, zpk = _quantize_asymmetric(K, bits=st.bits_k, group_size=st.group_size,
+                                            mode="asymmetric_channel", t_tile=T_TILE)
+            # per-channel stats stored once
+            if st.K_scale is None: st.K_scale = sk.contiguous()
+            if st.K_zp    is None: st.K_zp    = zpk.contiguous()
+            sk_to_store, zpk_to_store = None, None  # don't store per-chunk
         elif mk == "asymmetric_token":
-            qk, sk, zpk = _quantize_asymmetric(K, bits=st.bits_k, group_size=st.group_size, mode="asymmetric_token")
-        elif mk in ("symmetric_channel", "symmetric"):
-            qk, sk = _quantize_symmetric(K, bits=st.bits_k, group_size=st.group_size, mode="symmetric_channel")
-            zpk = None
+            qk, sk, zpk = _quantize_asymmetric(K, bits=st.bits_k, group_size=st.group_size,
+                                            mode="asymmetric_token", t_tile=T_TILE)
+            sk_to_store, zpk_to_store = sk, zpk     # store per-chunk
+        elif mk in ("symmetric_channel"):
+            qk, sk = _quantize_symmetric(K, bits=st.bits_k, group_size=st.group_size,
+                                        mode="symmetric_channel", t_tile=T_TILE)
+            zpk, sk_to_store, zpk_to_store = None, None, None
+            if st.K_scale is None: st.K_scale = sk.contiguous()
         elif mk == "symmetric_token":
-            qk, sk = _quantize_symmetric(K, bits=st.bits_k, group_size=st.group_size, mode="symmetric_token")
-            zpk = None
+            qk, sk = _quantize_symmetric(K, bits=st.bits_k, group_size=st.group_size,
+                                        mode="symmetric_token", t_tile=T_TILE)
+            zpk, sk_to_store, zpk_to_store = None, sk, None
         else:
             raise ValueError(f"Unknown mode_k={mk}")
 
         # V
         mv = getattr(st, "mode_v", "symmetric_channel")
-        if mv == "asymmetric_token":
-            qv, sv, zpv = _quantize_asymmetric(V, bits=st.bits_v, group_size=st.group_size, mode="asymmetric_token")
-        elif mv == "asymmetric_channel":
-            qv, sv, zpv = _quantize_asymmetric(V, bits=st.bits_v, group_size=st.group_size, mode="asymmetric_channel")
-        elif mv in ("symmetric_channel", "symmetric"):
-            qv, sv = _quantize_symmetric(V, bits=st.bits_v, group_size=st.group_size, mode="symmetric_channel")
-            zpv = None
+        if mv == "asymmetric_channel":
+            qv, sv, zpv = _quantize_asymmetric(V, bits=st.bits_v, group_size=st.group_size,
+                                            mode="asymmetric_channel", t_tile=T_TILE)
+            if st.V_scale is None: st.V_scale = sv.contiguous()
+            if st.V_zp    is None: st.V_zp    = zpv.contiguous()
+            sv_to_store, zpv_to_store = None, None
+        elif mv == "asymmetric_token":
+            qv, sv, zpv = _quantize_asymmetric(V, bits=st.bits_v, group_size=st.group_size,
+                                            mode="asymmetric_token", t_tile=T_TILE)
+            sv_to_store, zpv_to_store = sv, zpv
+        elif mv in ("symmetric_channel"):
+            qv, sv = _quantize_symmetric(V, bits=st.bits_v, group_size=st.group_size,
+                                        mode="symmetric_channel", t_tile=T_TILE)
+            zpv, sv_to_store, zpv_to_store = None, None, None
+            if st.V_scale is None: st.V_scale = sv.contiguous()
         elif mv == "symmetric_token":
-            qv, sv = _quantize_symmetric(V, bits=st.bits_v, group_size=st.group_size, mode="symmetric_token")
-            zpv = None
+            qv, sv = _quantize_symmetric(V, bits=st.bits_v, group_size=st.group_size,
+                                        mode="symmetric_token", t_tile=T_TILE)
+            zpv, sv_to_store, zpv_to_store = None, sv, None
         else:
             raise ValueError(f"Unknown mode_v={mv}")
 
-        def _cat0(old, new):
-            if old is None or (isinstance(old, torch.Tensor) and old.numel() == 0):
-                return new.contiguous()
-            return torch.cat([old, new], dim=0).contiguous()
+        # ---- append into chunk-lists (NO torch.cat) ----
+        st.K_chunks.append(qk.contiguous())
+        st.V_chunks.append(qv.contiguous())
+        if sk_to_store is not None: st.Ks_chunks.append(sk_to_store.contiguous())
+        if sv_to_store is not None: st.Vs_chunks.append(sv_to_store.contiguous())
+        if zpk_to_store is not None:
+            if getattr(st, "Kzp_chunks", None) is None: st.Kzp_chunks = []
+            st.Kzp_chunks.append(zpk_to_store.contiguous())
+        if zpv_to_store is not None:
+            if getattr(st, "Vzp_chunks", None) is None: st.Vzp_chunks = []
+            st.Vzp_chunks.append(zpv_to_store.contiguous())
 
-        # ---- append packed ----
-        st.K_packed = _cat0(st.K_packed, qk)
-        st.V_packed = _cat0(st.V_packed, qv)
-
-        # ---- scales/zp handling ----
-        # K scales/zp
-        if zpk is None:
-            if mk == "symmetric_token":
-                st.K_scale = _cat0(st.K_scale, sk)
-            else:  # symmetric_channel (time-invariant)
-                if st.K_scale is None or (isinstance(st.K_scale, torch.Tensor) and st.K_scale.numel() == 0):
-                    st.K_scale = sk.contiguous()
-        else:
-            if mk == "asymmetric_token":
-                st.K_scale = _cat0(st.K_scale, sk)
-                st.K_zp    = _cat0(st.K_zp,    zpk)
-            else:  # asymmetric_channel
-                if st.K_scale is None or st.K_scale.numel() == 0:
-                    st.K_scale = sk.contiguous()
-                if st.K_zp is None or (isinstance(st.K_zp, torch.Tensor) and st.K_zp.numel() == 0):
-                    st.K_zp = zpk.contiguous()
-
-        # V scales/zp
-        if zpv is None:
-            if mv == "symmetric_token":
-                st.V_scale = _cat0(st.V_scale, sv)
-            else:
-                if st.V_scale is None or (isinstance(st.V_scale, torch.Tensor) and st.V_scale.numel() == 0):
-                    st.V_scale = sv.contiguous()
-        else:
-            if mv == "asymmetric_token":
-                st.V_scale = _cat0(st.V_scale, sv)
-                st.V_zp    = _cat0(st.V_zp,    zpv)
-            else:
-                if st.V_scale is None or st.V_scale.numel() == 0:
-                    st.V_scale = sv.contiguous()
-                if st.V_zp is None or (isinstance(st.V_zp, torch.Tensor) and st.V_zp.numel() == 0):
-                    st.V_zp = zpv.contiguous()
-
-        # ---- advance T ----
+        # ---- update T & byte counters ----
         st.T = int(st.T) + int(T_new)
-
-        # ---- byte accounting (packed + scale + zp) ----
         self.bytes_total += int(qk.numel() * qk.element_size()) + int(qv.numel() * qv.element_size())
-        # K
-        if zpk is None:
-            if mk == "symmetric_token":
-                self.bytes_scales += int(sk.numel() * sk.element_size())
-            else:
-                if int(st.T) == T_new:
-                    self.bytes_scales += int(sk.numel() * sk.element_size())
-        else:
-            if mk == "asymmetric_token":
-                self.bytes_scales += int(sk.numel() * sk.element_size())
-                self.bytes_zp     += int(zpk.numel())
-            else:
-                if int(st.T) == T_new:
-                    self.bytes_scales += int(sk.numel() * sk.element_size())
-                    self.bytes_zp     += int(zpk.numel())
-        # V
-        if zpv is None:
-            if mv == "symmetric_token":
-                self.bytes_scales += int(sv.numel() * sv.element_size())
-            else:
-                if int(st.T) == T_new:
-                    self.bytes_scales += int(sv.numel() * sv.element_size())
-        else:
-            if mv == "asymmetric_token":
-                self.bytes_scales += int(sv.numel() * sv.element_size())
-                self.bytes_zp     += int(zpv.numel())
-            else:
-                if int(st.T) == T_new:
-                    self.bytes_scales += int(sv.numel() * sv.element_size())
-                    self.bytes_zp     += int(zpv.numel())
-        
+
+        # K bytes (scales/zp)
+        if mk == "symmetric_token" and sk_to_store is not None:
+            self.bytes_scales += int(sk_to_store.numel() * sk_to_store.element_size())
+        elif mk in ("symmetric_channel", "symmetric") and int(st.T) == T_new:
+            self.bytes_scales += int(st.K_scale.numel() * st.K_scale.element_size())
+        elif mk == "asymmetric_token":
+            self.bytes_scales += int(sk_to_store.numel() * sk_to_store.element_size())
+            self.bytes_zp     += int(zpk_to_store.numel())
+        elif mk == "asymmetric_channel" and int(st.T) == T_new:
+            self.bytes_scales += int(st.K_scale.numel() * st.K_scale.element_size())
+            self.bytes_zp     += int(st.K_zp.numel())
+
+        # V bytes (scales/zp)
+        if mv == "symmetric_token" and sv_to_store is not None:
+            self.bytes_scales += int(sv_to_store.numel() * sv_to_store.element_size())
+        elif mv in ("symmetric_channel", "symmetric") and int(st.T) == T_new:
+            self.bytes_scales += int(st.V_scale.numel() * st.V_scale.element_size())
+        elif mv == "asymmetric_token":
+            self.bytes_scales += int(sv_to_store.numel() * sv_to_store.element_size())
+            self.bytes_zp     += int(zpv_to_store.numel())
+        elif mv == "asymmetric_channel" and int(st.T) == T_new:
+            self.bytes_scales += int(st.V_scale.numel() * st.V_scale.element_size())
+            self.bytes_zp     += int(st.V_zp.numel())
 
         if getattr(self, "debug", False):
             add_bytes = (qk.numel()*qk.element_size() + qv.numel()*qv.element_size())
-            print(f"[KVQDBG] L{layer_idx} _append_core: +packed={add_bytes}B (tot_packed={self.bytes_total}B)", flush=True)
-
-
+            print(f"[KVQDBG] L{layer_idx} append_chunked: +T={T_new} +packed={add_bytes}B (tot_packed={self.bytes_total}B)", flush=True)
 
     def dequant_slice(self, layer_idx: int, t_slice: slice) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return fp16 K,V for given time slice [start:stop]. Shapes [T,H,D]."""
+        """Return fp16 K,V for given time slice [start:stop]. Shapes [T,H,D].
+        Works over chunked storage without allocating a big intermediate.
+        """
         st = self.layers[layer_idx]
         start, stop, _ = t_slice.indices(st.T)
-        T = stop - start
+        Twant = stop - start
+        H, D = st.H, st.D
+        dev = self.device
+
+        K_out = torch.empty((Twant, H, D), dtype=torch.float16, device=dev)
+        V_out = torch.empty((Twant, H, D), dtype=torch.float16, device=dev)
 
         # ---- K ----
-        Kp = st.K_packed[start:stop]
         mk = getattr(st, "mode_k", "symmetric_channel")
-        if mk in ("asymmetric_channel", "asymmetric_token"):
+        if mk == "asymmetric_channel":
+            Ks, Kzp = st.K_scale, st.K_zp
+        elif mk in ("symmetric_channel"):
+            Ks = st.K_scale
+
+        for i, off, take, dst in _iter_covering(st.K_chunks, start, stop):
+            Kp = st.K_chunks[i][off:off+take]
             if mk == "asymmetric_token":
-                Ks = st.K_scale[start:stop]; Kzp = st.K_zp[start:stop]
-            else:
-                Ks = st.K_scale; Kzp = st.K_zp
-            K = _dequantize_asymmetric(
-                Kp, Ks, Kzp, bits=st.bits_k, group_size=st.group_size,
-                mode=mk, T=T, H=st.H, D=st.D
-            )
-        else:
-            # symmetric family
-            if mk in ("symmetric_token",):
-                Ks = st.K_scale[start:stop]; mode_eff = "symmetric_token"
-            else:
-                Ks = st.K_scale; mode_eff = "symmetric_channel"
-            K  = _dequantize_symmetric(
-                Kp, Ks, bits=st.bits_k, group_size=st.group_size,
-                mode=mode_eff, T=T, H=st.H, D=st.D
-            )
+                Ks = st.Ks_chunks[i][off:off+take]; Kzp = st.Kzp_chunks[i][off:off+take]
+                Kt = _dequantize_asymmetric(Kp, Ks, Kzp, bits=st.bits_k, group_size=st.group_size,
+                                            mode="asymmetric_token", T=take, H=H, D=D)
+            elif mk == "asymmetric_channel":
+                Kt = _dequantize_asymmetric(Kp, Ks, Kzp, bits=st.bits_k, group_size=st.group_size,
+                                            mode="asymmetric_channel", T=take, H=H, D=D)
+            elif mk == "symmetric_token":
+                Ks = st.Ks_chunks[i][off:off+take]
+                Kt = _dequantize_symmetric(Kp, Ks, bits=st.bits_k, group_size=st.group_size,
+                                        mode="symmetric_token", T=take, H=H, D=D)
+            else:  # symmetric_channel or symmetric
+                Kt = _dequantize_symmetric(Kp, Ks, bits=st.bits_k, group_size=st.group_size,
+                                        mode="symmetric_channel", T=take, H=H, D=D)
+            K_out[dst:dst+take].copy_(Kt, non_blocking=True)
 
         # ---- V ----
-        Vp = st.V_packed[start:stop]
         mv = getattr(st, "mode_v", "symmetric_channel")
-        if mv in ("asymmetric_channel", "asymmetric_token"):
-            if mv == "asymmetric_token":
-                Vs = st.V_scale[start:stop]; Vzp = st.V_zp[start:stop]
-            else:
-                Vs = st.V_scale; Vzp = st.V_zp
-            V = _dequantize_asymmetric(
-                Vp, Vs, Vzp, bits=st.bits_v, group_size=st.group_size,
-                mode=mv, T=T, H=st.H, D=st.D
-            )
-        else:
-            if mv in ("symmetric_token",):
-                Vs = st.V_scale[start:stop]; mode_eff_v = "symmetric_token"
-            else:
-                Vs = st.V_scale; mode_eff_v = "symmetric_channel"
-            V  = _dequantize_symmetric(
-                Vp, Vs, bits=st.bits_v, group_size=st.group_size,
-                mode=mode_eff_v, T=T, H=st.H, D=st.D
-            )
+        if mv == "asymmetric_channel":
+            Vs, Vzp = st.V_scale, st.V_zp
+        elif mv in ("symmetric_channel"):
+            Vs = st.V_scale
 
-        return K, V
+        for i, off, take, dst in _iter_covering(st.V_chunks, start, stop):
+            Vp = st.V_chunks[i][off:off+take]
+            if mv == "asymmetric_token":
+                Vs = st.Vs_chunks[i][off:off+take]; Vzp = st.Vzp_chunks[i][off:off+take]
+                Vt = _dequantize_asymmetric(Vp, Vs, Vzp, bits=st.bits_v, group_size=st.group_size,
+                                            mode="asymmetric_token", T=take, H=H, D=D)
+            elif mv == "asymmetric_channel":
+                Vt = _dequantize_asymmetric(Vp, Vs, Vzp, bits=st.bits_v, group_size=st.group_size,
+                                            mode="asymmetric_channel", T=take, H=H, D=D)
+            elif mv == "symmetric_token":
+                Vs = st.Vs_chunks[i][off:off+take]
+                Vt = _dequantize_symmetric(Vp, Vs, bits=st.bits_v, group_size=st.group_size,
+                                        mode="symmetric_token", T=take, H=H, D=D)
+            else:
+                Vt = _dequantize_symmetric(Vp, Vs, bits=st.bits_v, group_size=st.group_size,
+                                        mode="symmetric_channel", T=take, H=H, D=D)
+            V_out[dst:dst+take].copy_(Vt, non_blocking=True)
+
+        return K_out, V_out
+
 
     def dequant_slice_into(self, layer_idx: int, t_slice: slice, out_k: torch.Tensor, out_v: torch.Tensor):
         """Dequantize [start:stop] directly into provided GPU scratch buffers."""

@@ -8,98 +8,147 @@ from vllm.v1.metrics.kv_quant import KVQuantLayerRecord
 # -------------------------
 # Helpers for (de)quant
 # -------------------------
+T_TILE = 256  # T-tiling for memory-safe quantization
 
 def _amax_channelwise(x: torch.Tensor, dim: int) -> torch.Tensor:
     # amax along specified dim (keepdim=True for broadcasting)
     return x.abs().amax(dim=dim, keepdim=True).clamp_min_(1e-8)
 
-def _quantize_symmetric(x: torch.Tensor, *, bits: int, group_size: int, mode: str) -> Tuple[torch.Tensor, torch.Tensor]:
+def _quantize_symmetric(x: torch.Tensor, *, bits: int, group_size: int, mode: str,
+                        t_tile: int = T_TILE) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Symmetric quantization without zero-point.
-      - symmetric_channel : time-invariant scale per (H, D-group)
-      - symmetric_token   : per-token scale per (T, H, D-group)
+    Memory-safe symmetric quantization (all compute in fp16) with T-tiling.
+      - mode='symmetric_channel' : time-invariant scale per (H, D-group)
+      - mode='symmetric_token'   : per-token scale per (T, H, D-group)
+    Returns: (q_packed, scale)
     """
-    assert x.dim() == 3, "Expected [T, H, D]"
-    assert mode in ("symmetric_channel", "symmetric_token")
+    assert x.dim() == 3 and mode in ("symmetric_channel", "symmetric_token")
     T, H, D = x.shape
-
-    # levels for signed symmetric
+    # signed symmetric code range (2's complement for packing)
     if bits == 8:
-        qmax = 127.0
+        qmin, qmax = -128, 127
     elif bits == 4:
-        qmax = 7.0
+        qmin, qmax = -8, 7
     elif bits == 2:
-        qmax = 1.0
+        qmin, qmax = -2, 1
     else:
         raise ValueError(f"Unsupported bits={bits}")
 
-    # Pad D to multiple of group_size for grouping
-    if D % group_size != 0:
-        pad = group_size - (D % group_size)
-        x_pad = torch.nn.functional.pad(x, (0, pad))
-        Dp = x_pad.shape[-1]
-    else:
-        x_pad = x
-        Dp = D
-    G = Dp // group_size
-    xg = x_pad.view(T, H, G, group_size)
+    # group split (Mistral: D=128, group_size=64 -> G=2; Generally D%group_size==0)
+    G = (D + group_size - 1) // group_size
+    xg = x.view(T, H, G, group_size)
 
-    # ---- scale computation (FIX: don't collapse H for channel mode) ----
-    if mode == "symmetric_channel":
-        # reduce over time and within group -> [H,G]
-        amax = xg.abs().amax(dim=(0, 3))        # [H, G]
-        scale = (amax / qmax).clamp_min(1e-8).to(torch.float16)   # [H,G]
-        s = scale.view(1, H, G, 1).to(x.dtype)
-    else:
-        # symmetric_token: per token -> [T,H,G]
-        amax = xg.abs().amax(dim=3)             # [T, H, G]
-        scale = (amax / qmax).clamp_min(1e-8).to(torch.float16)   # [T,H,G]
-        s = scale.view(T, H, G, 1).to(x.dtype)
-
-    # quantize & pack
-    q = torch.round(xg / s)
+    # output buffers
     if bits == 8:
-        q = q.clamp_(-128, 127).to(torch.int8).view(T, H, Dp)
-        q_packed = q[..., :D].contiguous()
+        q_out = torch.empty((T, H, D), dtype=torch.int8, device=x.device)
     elif bits == 4:
-        q = q.clamp_(-8, 7).to(torch.int8).view(T, H, Dp)
-        q_packed = _pack_nibble_signed(q)[..., : (D // 2)]
-    else:  # 2-bit
-        q = q.clamp_(-2, 1).to(torch.int8).view(T, H, Dp)
-        q_packed = _pack_2bit_signed(q)[..., : (D // 4)]
+        q_out = torch.empty((T, H, (D + 1) // 2), dtype=torch.uint8, device=x.device)  # nibble packed
+    else:
+        q_out = torch.empty((T, H, (D + 3) // 4), dtype=torch.uint8, device=x.device)  # 2bit packed
 
-    return q_packed.contiguous(), scale.contiguous()
+    eps = 1e-8
+    if mode == "symmetric_channel":
+        # scale: [H,G] (time-invariant)
+        amax = xg.abs().amax(dim=(0, 3))                           # [H,G]
+        scale = (amax / float(max(abs(qmin), qmax))).clamp_min(eps).to(torch.float16)  # [H,G]
+        s = scale.view(1, H, G, 1).to(x.dtype)                     # fp16 broadcast
 
-def _dequantize_symmetric(q_packed, scale: torch.Tensor, *, bits: int, 
-            group_size: int, mode: str, T: int, H: int, D: int) -> torch.Tensor:
+        for t0 in range(0, T, t_tile):
+            t1 = min(T, t0 + t_tile)
+            xt = xg[t0:t1]                                         # [t,H,G,gs]
+            tmp = xt.div(s)                                        # fp16
+            torch.round(tmp, out=tmp)
+            tmp.clamp_(qmin, qmax)
+            qi8 = tmp.view(t1 - t0, H, G * group_size)[:, :, :D].to(torch.int8)
+            if bits == 8:
+                q_out[t0:t1] = qi8
+            elif bits == 4:
+                q_out[t0:t1] = _pack_nibble_signed(qi8)
+            else:
+                q_out[t0:t1] = _pack_2bit_signed(qi8)
+
+    else:  # symmetric_token
+        # scale: [T,H,G] (time-varying). Allocate final scale once
+        scale = torch.empty((T, H, G), dtype=torch.float16, device=x.device)
+        for t0 in range(0, T, t_tile):
+            t1 = min(T, t0 + t_tile)
+            xt = xg[t0:t1]                                         # [t,H,G,gs]
+            amax_t = xt.abs().amax(dim=3)                          # [t,H,G]
+            st = (amax_t / float(max(abs(qmin), qmax))).clamp_min(eps).to(torch.float16)
+            scale[t0:t1] = st
+            s = st.view(t1 - t0, H, G, 1).to(x.dtype)              # fp16
+            tmp = xt.div(s)
+            torch.round(tmp, out=tmp)
+            tmp.clamp_(qmin, qmax)
+            qi8 = tmp.view(t1 - t0, H, G * group_size)[:, :, :D].to(torch.int8)
+            if bits == 8:
+                q_out[t0:t1] = qi8
+            elif bits == 4:
+                q_out[t0:t1] = _pack_nibble_signed(qi8)
+            else:
+                q_out[t0:t1] = _pack_2bit_signed(qi8)
+
+    return q_out.contiguous(), (scale if mode == "symmetric_token" else scale.contiguous())
+
+def _dequantize_symmetric(q_packed, scale: torch.Tensor, *, bits: int,
+                          group_size: int, mode: str, T: int, H: int, D: int) -> torch.Tensor:
     """
     Inverse of symmetric quantization.
-      - symmetric_channel : scale shape [H,G]
-      - symmetric_token   : scale shape [T,H,G]
+      - symmetric_channel : scale [H,G]
+      - symmetric_token   : scale [T,H,G]
+    All math in fp16. Unpackers return int8 then cast to fp16.
     """
     assert mode in ("symmetric_channel", "symmetric_token")
-    # unpack
+    # unpack → int8
     if bits == 8:
-        q = q_packed.to(torch.float32)                     # [T,H,D]
+        qi8 = q_packed.view(T, H, D).to(torch.int8)                # [T,H,D]
     elif bits == 4:
-        q = _unpack_nibble_signed(q_packed, T, H, D)       # float32 [T,H,D]
+        qi8 = _unpack_nibble_signed_i8(q_packed, T, H, D)          # int8 [T,H,D]
     elif bits == 2:
-        q = _unpack_2bit_signed(q_packed, T, H, D)         # float32 [T,H,D]
+        qi8 = _unpack_2bit_signed_i8(q_packed, T, H, D)            # int8 [T,H,D]
     else:
         raise ValueError(f"Unsupported bits={bits}")
 
-    # regroup and apply scale
+    # group view
     Dp = ((D + group_size - 1) // group_size) * group_size
     G  = Dp // group_size
-    qg = torch.nn.functional.pad(q, (0, Dp - D)).view(T, H, G, group_size)
+    if Dp != D:
+        # pad tail to full group width (int8)
+        qi8 = torch.nn.functional.pad(qi8, (0, Dp - D))
+    qg = qi8.view(T, H, G, group_size)                              # int8
 
+    # broadcast scale
     if mode == "symmetric_channel":
-        s = scale.view(1, H, G, 1).to(torch.float16)       # [1,H,G,1]
+        s = scale.view(1, H, G, 1).to(torch.float16)
     else:
-        s = scale.view(T, H, G, 1).to(torch.float16)       # [T,H,G,1]
+        s = scale.view(T, H, G, 1).to(torch.float16)
 
-    x = (qg.to(torch.float16)) * s
+    x = qg.to(torch.float16) * s
     return x.view(T, H, Dp)[..., :D].contiguous()
+
+def _unpack_nibble_signed_i8(packed: torch.Tensor, T: int, H: int, D: int) -> torch.Tensor:
+    """Unpack uint8 -> signed int4 in int8 tensor [-8..7], shape [T,H,D]."""
+    b = packed.view(T, H, -1)
+    lo = (b & 0x0F).to(torch.int8) - 8
+    hi = ((b >> 4) & 0x0F).to(torch.int8) - 8
+    out = torch.empty((T, H, (b.shape[-1] * 2)), dtype=torch.int8, device=packed.device)
+    out[..., 0::2] = lo
+    out[..., 1::2] = hi
+    return out[..., :D].contiguous()
+
+def _unpack_2bit_signed_i8(packed: torch.Tensor, T: int, H: int, D: int) -> torch.Tensor:
+    """Unpack uint8 -> signed 2-bit in int8 tensor [-2..1], shape [T,H,D]."""
+    b = packed.view(T, H, -1)
+    a0 = ( b        & 0x03).to(torch.int8) - 2
+    a1 = ((b >> 2)  & 0x03).to(torch.int8) - 2
+    a2 = ((b >> 4)  & 0x03).to(torch.int8) - 2
+    a3 = ((b >> 6)  & 0x03).to(torch.int8) - 2
+    out = torch.empty((T, H, b.shape[-1] * 4), dtype=torch.int8, device=packed.device)
+    out[..., 0::4] = a0
+    out[..., 1::4] = a1
+    out[..., 2::4] = a2
+    out[..., 3::4] = a3
+    return out[..., :D].contiguous()
 
 
 def _asym_qparams(x: torch.Tensor, bits: int, reduce_over_time: bool, group_size: int):
@@ -137,51 +186,93 @@ def _asym_qparams(x: torch.Tensor, bits: int, reduce_over_time: bool, group_size
     return scale.to(torch.float16), zp, Dg, reduce_shape
 
 def _quantize_asymmetric(x: torch.Tensor, *, bits: int, group_size: int,
-                         mode: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                         mode: str, t_tile: int = T_TILE) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Asymmetric quantization:
-      mode='asymmetric_channel' -> per-channel-asym (reduce over T + group_size)
-      mode='asymmetric_token'   -> per-token-asym   (reduce over group_size)
-    Returns (q_packed, scale, zp). q_packed dtype=uint8 (packed if bits<8).
+    Memory-safe asymmetric quantization (all math in fp16) with T-tiling.
+      - mode='asymmetric_channel' : scale/zp [H,Dg]
+      - mode='asymmetric_token'   : scale/zp [T,H,Dg]
+    Returns (q_packed, scale(fp16), zp(uint8)).
     """
-    import torch
     assert mode in ("asymmetric_channel", "asymmetric_token")
-    reduce_over_time = (mode == "asymmetric_channel")
-    scale, zp, Dg, _ = _asym_qparams(x, bits, reduce_over_time, group_size)
-
-    # broadcast to [T,H,D] with grouped zp/scale
     T, H, D = x.shape
+    Dg = (D + group_size - 1) // group_size
     xg = x.view(T, H, Dg, group_size)
-    if reduce_over_time:
-        s = scale.view(1, H, Dg, 1).to(x.dtype)
-        z = zp.view(1, H, Dg, 1).to(torch.int32)
-    else:
-        s = scale.view(T, H, Dg, 1).to(x.dtype)
-        z = zp.view(T, H, Dg, 1).to(torch.int32)
 
-    q = torch.round((xg / s) + z).clamp_(0, (1 << bits) - 1).to(torch.uint8)
-    q = q.view(T, H, D)
+    qmax = (1 << bits) - 1
+    eps = 1e-8
 
-    # pack along last dim
-    if bits == 8:
-        q_packed = q
-    elif bits == 4:
-        q_packed = _pack_nibble_u4(q)
-    elif bits == 2:
-        q_packed = _pack_2bit_u2(q)
+    if mode == "asymmetric_channel":
+        x_min = xg.amin(dim=(0, 3))                                  # [H,Dg]
+        x_max = xg.amax(dim=(0, 3))                                  # [H,Dg]
+        scale = ((x_max - x_min).clamp_min(eps) / float(qmax)).to(torch.float16)
+        zp    = torch.round((-x_min / scale).clamp_(0, qmax)).to(torch.uint8)
+
+        # outputs
+        if bits == 8:
+            q_out = torch.empty((T, H, D), dtype=torch.uint8, device=x.device)
+        elif bits == 4:
+            q_out = torch.empty((T, H, D // 2), dtype=torch.uint8, device=x.device)
+        else:
+            q_out = torch.empty((T, H, D // 4), dtype=torch.uint8, device=x.device)
+
+        s = scale.view(1, H, Dg, 1).to(x.dtype)                       # fp16
+        z = zp.view(1, H, Dg, 1).to(x.dtype)                          # fp16
+        for t0 in range(0, T, t_tile):
+            t1 = min(T, t0 + t_tile)
+            xt = xg[t0:t1]
+            tmp = xt.div(s).add_(z)                                   # fp16
+            torch.round(tmp, out=tmp)
+            tmp.clamp_(0, qmax)
+            qt = tmp.view(t1 - t0, H, D).to(torch.uint8)
+            if bits == 8:
+                q_out[t0:t1] = qt
+            elif bits == 4:
+                q_out[t0:t1] = _pack_nibble_u4(qt)
+            else:
+                q_out[t0:t1] = _pack_2bit_u2(qt)
+
+        return q_out.contiguous(), scale.contiguous(), zp.contiguous()
+
     else:
-        raise ValueError(f"Unsupported bits={bits} for asymmetric")
-    return q_packed.contiguous(), scale.contiguous(), zp.contiguous()
+        # per-token stats
+        x_min = xg.amin(dim=3)                                        # [T,H,Dg]
+        x_max = xg.amax(dim=3)                                        # [T,H,Dg]
+        scale = ((x_max - x_min).clamp_min(eps) / float(qmax)).to(torch.float16)
+        zp    = torch.round((-x_min / scale).clamp_(0, qmax)).to(torch.uint8)
+
+        if bits == 8:
+            q_out = torch.empty((T, H, D), dtype=torch.uint8, device=x.device)
+        elif bits == 4:
+            q_out = torch.empty((T, H, D // 2), dtype=torch.uint8, device=x.device)
+        else:
+            q_out = torch.empty((T, H, D // 4), dtype=torch.uint8, device=x.device)
+
+        for t0 in range(0, T, t_tile):
+            t1 = min(T, t0 + t_tile)
+            xt = xg[t0:t1]
+            st = scale[t0:t1].view(t1 - t0, H, Dg, 1).to(x.dtype)
+            zt = zp[t0:t1].view(t1 - t0, H, Dg, 1).to(x.dtype)
+            tmp = xt.div(st).add_(zt)
+            torch.round(tmp, out=tmp)
+            tmp.clamp_(0, qmax)
+            qt = tmp.view(t1 - t0, H, D).to(torch.uint8)
+            if bits == 8:
+                q_out[t0:t1] = qt
+            elif bits == 4:
+                q_out[t0:t1] = _pack_nibble_u4(qt)
+            else:
+                q_out[t0:t1] = _pack_2bit_u2(qt)
+
+        return q_out.contiguous(), scale.contiguous(), zp.contiguous()
 
 def _dequantize_asymmetric(q_packed: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor,
                            *, bits: int, group_size: int, mode: str,
                            T: int, H: int, D: int) -> torch.Tensor:
     """
-    Inverse of _quantize_asymmetric. Returns fp16 tensor [T,H,D].
+    Inverse of _quantize_asymmetric. All math in fp16.
     """
-    import torch
     assert mode in ("asymmetric_channel", "asymmetric_token")
-    # unpack
+    # unpack to uint8 then fp16
     if bits == 8:
         q = q_packed
     elif bits == 4:
@@ -192,17 +283,16 @@ def _dequantize_asymmetric(q_packed: torch.Tensor, scale: torch.Tensor, zp: torc
         raise ValueError(f"Unsupported bits={bits}")
 
     Dg = (D + group_size - 1) // group_size
-    qg = q.view(T, H, Dg, group_size).to(torch.int32)
+    qf = q.view(T, H, Dg, group_size).to(torch.float16)
 
-    # broadcast zp/scale
     if mode == "asymmetric_channel":
         s = scale.view(1, H, Dg, 1).to(torch.float16)
-        z = zp.view(1, H, Dg, 1).to(torch.int32)
+        z = zp.view(1, H, Dg, 1).to(torch.float16)
     else:
         s = scale.view(T, H, Dg, 1).to(torch.float16)
-        z = zp.view(T, H, Dg, 1).to(torch.int32)
+        z = zp.view(T, H, Dg, 1).to(torch.float16)
 
-    x = (qg.to(torch.float16) - z.to(torch.float16)) * s
+    x = (qf - z) * s
     return x.view(T, H, D).contiguous()
     
 # ----- packing utils (signed) -----

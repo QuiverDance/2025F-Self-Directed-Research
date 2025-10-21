@@ -727,6 +727,17 @@ class PagedKVCacheQuantized:
             print(f"[KVQDBG] L{layer_idx} scratch shapes: K{tuple(out_k.shape)} V{tuple(out_v.shape)}", flush=True)
         return out_k, out_v
 
+    def _maybe_release_cuda_cache(self, where: str):
+        import torch
+        free_b = _cuda_free_bytes()
+        if free_b < self.lowmem_guard_bytes:
+            if getattr(self, "debug", False):
+                print(f"[KVQDBG][LOWMEM] free={_mb(free_b)}MiB < {_mb(self.lowmem_guard_bytes)}MiB @ {where} -> empty_cache()+shrink T_TILE", flush=True)
+            torch.cuda.empty_cache()
+            # shrink T_TILE by half, but not below min_t_tile
+            if hasattr(self, "t_tile"):
+                self.t_tile = max(self.min_t_tile, int(self.t_tile // 2) or self.min_t_tile)
+
     # Simple metric helpers
     def bytes_summary(self) -> Dict[str, int]:
         return {"kv_bytes_total_packed": int(self.bytes_total), "kv_bytes_scales": int(self.bytes_scales)}

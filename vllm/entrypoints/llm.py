@@ -331,7 +331,7 @@ class LLM:
                 debug_flag = bool(kwargs.get("kv_quant_debug", False))
                 debug_interval = int(kwargs.get("kv_quant_log_interval", 128))
                 kvq = PagedKVCacheQuantized(
-                    n_layers=num_layers,
+                    num_layers=num_layers,
                     policies=policies,
                     device=device,
                     debug=debug_flag,

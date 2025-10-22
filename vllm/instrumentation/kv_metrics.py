@@ -75,6 +75,11 @@ class RequestLog:
     kv_bytes_total_packed_at_prefill: Optional[int] = None
     kv_bytes_total_packed_at_decode: Optional[int] = None
 
+    kv_bytes_scales_at_prefill: Optional[int] = None
+    kv_bytes_scales_at_decode: Optional[int] = None
+    kv_bytes_zp_at_prefill: Optional[int] = None
+    kv_bytes_zp_at_decode: Optional[int] = None
+
     # Token-based KV size (for transparency; not used for scheduling)
     kv_token_bytes_est_at_prefill: Optional[int] = None
     kv_token_bytes_est_at_decode: Optional[int] = None
@@ -359,15 +364,22 @@ class KVMetricsCollector:
             except Exception:
                 pass
 
+                        # Read kvq compressed footprint
             qpacked = 0
+            qscales = 0
+            qzp     = 0
             kvq = None
             try:
                 kvq = getattr(self, "_kvq_ref", None)
                 if kvq is not None and hasattr(kvq, "bytes_summary"):
                     bs = kvq.bytes_summary()
                     qpacked = int(bs.get("kv_bytes_total_packed", 0) or 0)
+                    qscales = int(bs.get("kv_bytes_scales", 0) or 0)
+                    qzp     = int(bs.get("kv_bytes_zp", 0) or 0)
             except Exception:
                 qpacked = 0
+                qscales = 0
+                qzp     = 0
 
             # Write into the record (dict-first; fallback to attribute if not a dict)
             if isinstance(rec, dict):
@@ -376,28 +388,27 @@ class KVMetricsCollector:
                 rec[key_cpu]   = cpu
                 rec[f"kv_token_bytes_est_at_{phase}"] = int(est_token_bytes)
                 rec[key_packed] = qpacked
+                rec[f"kv_bytes_scales_at_{phase}"] = qscales
+                rec[f"kv_bytes_zp_at_{phase}"]     = qzp
             else:
                 setattr(rec, key_total, total)
-                setattr(rec, key_gpu,   gpu)
-                setattr(rec, key_cpu,   cpu)
+                setattr(rec, key_gpu,  gpu)
+                setattr(rec, key_cpu,  cpu)
                 setattr(rec, f"kv_token_bytes_est_at_{phase}", int(est_token_bytes))
                 setattr(rec, key_packed, qpacked)
+                setattr(rec, f"kv_bytes_scales_at_{phase}", qscales)
+                setattr(rec, f"kv_bytes_zp_at_{phase}",     qzp)
 
-            # Maintain peak for summary
-            try:
-                prev_peak = int(self._agg.get("peak_kv_bytes_total", 0))
-                if total > prev_peak:
-                    self._agg["peak_kv_bytes_total"] = total
-            except Exception:
-                pass
-
+            # Debug payload (remove duplicated token-bytes key)
             _kvdbg("snapshot_kv.write", {
                 "rid": request_id, "phase": phase,
                 key_total: total, key_gpu: gpu, key_cpu: cpu,
                 f"kv_token_bytes_est_at_{phase}": int(est_token_bytes),
-                f"kv_token_bytes_est_at_{phase}": int(est_token_bytes),
                 key_packed: qpacked,
+                f"kv_bytes_scales_at_{phase}": qscales,
+                f"kv_bytes_zp_at_{phase}":     qzp,
             })
+
 
     
     def on_enqueue(self, request_id: str, context_len: int, meta: Optional[Dict[str, Any]] = None) -> None:

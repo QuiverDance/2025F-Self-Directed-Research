@@ -347,7 +347,8 @@ class LLM:
                 try:
                     from vllm.instrumentation.kv_metrics import KVMetricsCollector
                     KVMetricsCollector.get().set_kv_quant(kvq)
-                except Exception:
+                except Exception as e:
+                    print(f"[KVQ] failed to set kvq in KVMetricsCollector: {e}", flush=True)
                     pass
 
                 # 6) Wrap FlexAttentionImpl.forward:

@@ -305,6 +305,7 @@ class LLM:
             if getattr(kvq_cfg, "enable", False):
                 # Build quantized KV cache (chunk-based; our kv_cache_quant.py)
                 from vllm.v1.attention.kv_cache_quant import PagedKVCacheQuantized
+                from vllm.utils import Device
                 import torch
 
                 me = getattr(self.llm_engine, "model_executor", None)
@@ -324,8 +325,8 @@ class LLM:
                 device = (torch.device("cuda", torch.cuda.current_device())
                           if torch.cuda.is_available() else torch.device("cpu"))
 
-                # 3) layer policies (callable: idx -> LayerPolicy)
-                policies = kvq_cfg.policy_for
+                # 3) layer policies: build a dict {layer_idx: LayerPolicy} instead of passing a function
+                policies = {li: kvq_cfg.policy_for(li) for li in range(int(n_layers))}
 
                 # 4) construct kvq
                 debug_flag = bool(kwargs.get("kv_quant_debug", False))
@@ -333,6 +334,7 @@ class LLM:
                 kvq = PagedKVCacheQuantized(
                     num_layers=num_layers,
                     policies=policies,
+                    validate=bool(getattr(kvq_cfg, "validate", False)),
                     device=device,
                     debug=debug_flag,
                     log_interval=log_interval,

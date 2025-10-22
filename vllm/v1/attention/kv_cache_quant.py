@@ -158,6 +158,7 @@ class PagedKVCacheQuantized:
         self.num_layers = num_layers
         self.block_size = int(block_size)
         self.device = device
+        self.policies = policies
         self.layers: Dict[int, _LayerState] = {
             li: _LayerState(policy=policies.get(li, LayerPolicy())) for li in range(num_layers)
         }

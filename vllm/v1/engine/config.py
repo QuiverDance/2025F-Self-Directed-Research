@@ -87,7 +87,7 @@ class KVQuantConfig:
                 raise ValueError(f"default: invalid bits (K={default_policy.bits_k}, V={default_policy.bits_v})")
 
         return cls(enable=enable, fused_attn=fused, validate=validate,
-                   log_path=log_path, log_interval=log_interval, block_size=block_size
+                   log_path=log_path, log_interval=log_interval, block_size=block_size,
                    default_policy=default_policy, per_layer=per_layer)
 
     def policy_for(self, layer_idx: int) -> LayerPolicy:

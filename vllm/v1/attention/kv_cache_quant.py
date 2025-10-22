@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List
 import torch
 import math
+import logging
+from types import MethodType
 
 # Reuse the public record type for optional layer-wise logging (already used by metrics)
 from vllm.v1.metrics.kv_quant import KVQuantLayerRecord
@@ -18,6 +20,118 @@ def kvq_new_task():
     """Bump global epoch to signal cache reset for a new REQUEST."""
     global _KVQ_ACTIVE_EPOCH
     _KVQ_ACTIVE_EPOCH += 1
+
+# ==========================================================
+# Quant attach shim for vLLM BlockManager (paged KV backend)
+# ==========================================================
+def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
+    """Attach a write/read shim to the BlockManager so that KV is stored
+    in quantized form per layer/block, while the BlockPool scheduler,
+    allocation and eviction logic remain unchanged.
+
+    We do NOT touch CUDA kernels: at read, we dequantize only the requested
+    token slice into a scratch FP16 buffer passed to the kernel.
+    """
+    logger = logging.getLogger(__name__)
+
+    # Resolve manager
+    mgr = None
+    for name in ("kv_cache_manager", "block_manager", "cache_manager"):
+        mgr = getattr(scheduler, name, None) or mgr
+    if mgr is None or getattr(mgr, "_kvq_wrapped", False):
+        return False
+
+    # Layer policy resolver
+    if policy_fn is None:
+        policy_fn = getattr(kvq_cfg, "policy_for", None)
+    if policy_fn is None:
+        return False
+
+    # Debug & logging controls
+    mgr._kvq_debug = bool(getattr(kvq_cfg, "debug", False) or getattr(kvq_cfg, "kv_quant_debug", False))
+    mgr._kvq_log_interval = int(getattr(kvq_cfg, "log_interval", 0) or getattr(kvq_cfg, "kv_quant_log_interval", 0) or 0)
+
+    # Sidecar store & stats
+    mgr._kvq_wrapped = True
+    mgr._kvq_store = {}
+    mgr._kvq_stats = {"bytes_packed": 0, "bytes_scales": 0, "bytes_zp": 0}
+    mgr._kvq_token_count = 0
+
+    def _key(layer_idx: int, block_id: int):
+        return (int(layer_idx), int(block_id))
+
+    def _quant_pack(x: torch.Tensor, bits: int, group: int, mode: str):
+        x2 = x.contiguous().view(-1, x.shape[-2], x.shape[-1])  # [*, H, D]
+        scale, zp = _compute_groupwise_scale_zp(x2, bits, group, mode)
+        q = _quantize_u8(x2, scale, zp, bits, mode)
+        packed = _pack_bits(q, bits)
+        return packed, scale, zp
+
+    def _dequant_slice(packed, scale, zp, bits, mode, last_dim, out_shape):
+        unp = _unpack_bits(packed, bits, last_dim).view(*out_shape)
+        return _dequantize_u8(unp, scale, zp, bits, mode)
+
+    # ---- append wrapper: write quantized payload into sidecar
+    orig_append = getattr(mgr, "append_kv", None) or getattr(mgr, "append", None)
+    if orig_append is not None:
+        def _wrap_append(self, layer_idx, block_id, k, v, *args, **kwargs):
+            pol = policy_fn(int(layer_idx))
+            H, Dk = int(k.shape[-2]), int(k.shape[-1]); Dv = int(v.shape[-1])
+            kpk, ksc, kzp = _quant_pack(k, pol.bits_k, pol.group_size, pol.mode_k)
+            vpk, vsc, vzp = _quant_pack(v, pol.bits_v, pol.group_size, pol.mode_v)
+            self._kvq_store[_key(layer_idx, block_id)] = {
+                "K_packed": kpk, "K_scale": ksc, "K_zp": kzp,
+                "V_packed": vpk, "V_scale": vsc, "V_zp": vzp,
+                "H": torch.tensor(H), "Dk": torch.tensor(Dk), "Dv": torch.tensor(Dv),
+            }
+            self._kvq_stats["bytes_packed"] += int(kpk.numel() + vpk.numel())
+            self._kvq_stats["bytes_scales"] += int(ksc.numel() + vsc.numel())
+            self._kvq_stats["bytes_zp"]     += int((kzp.numel() if kzp is not None else 0)
+                                                   + (vzp.numel() if vzp is not None else 0))
+            # interval debug
+            self._kvq_token_count += int(k.shape[0])
+            if self._kvq_debug and (self._kvq_log_interval == 0 or
+                                    (self._kvq_token_count % self._kvq_log_interval == 0)):
+                logger.info("[KVQ] append layer=%s block=%s T+=%s stats(packed=%d, scales=%d, zp=%d) items=%d",
+                            int(layer_idx), int(block_id), int(k.shape[0]),
+                            self._kvq_stats["bytes_packed"], self._kvq_stats["bytes_scales"],
+                            self._kvq_stats["bytes_zp"], len(self._kvq_store))
+            return {"block_id": int(block_id), "kvq": True}
+        mgr._kvq_orig_append = orig_append
+        if hasattr(mgr, "append_kv"):
+            mgr.append_kv = _wrap_append.__get__(mgr, mgr.__class__)
+        else:
+            mgr.append = _wrap_append.__get__(mgr, mgr.__class__)
+
+    # ---- gather wrapper: on-demand dequant for requested token window
+    orig_gather = getattr(mgr, "gather_kv_slices", None) or getattr(mgr, "gather", None)
+    if orig_gather is not None:
+        def _wrap_gather(self, layer_idx, block_id, t_offset, t_len, device=None, *args, **kwargs):
+            pay = self._kvq_store.get(_key(layer_idx, block_id))
+            if pay is None:
+                return self._kvq_orig_gather(layer_idx, block_id, t_offset, t_len, device, *args, **kwargs)
+            H = int(pay["H"]); Dk = int(pay["Dk"]); Dv = int(pay["Dv"])
+            dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            K = torch.empty((t_len, H, Dk), dtype=torch.float16, device=dev)
+            V = torch.empty((t_len, H, Dv), dtype=torch.float16, device=dev)
+            kpk = pay["K_packed"][t_offset : t_offset + t_len]
+            vpk = pay["V_packed"][t_offset : t_offset + t_len]
+            ksc = pay["K_scale"]; kzp = pay["K_zp"]
+            vsc = pay["V_scale"]; vzp = pay["V_zp"]
+            pol = policy_fn(int(layer_idx))
+            K.copy_(_dequant_slice(kpk, ksc, kzp, pol.bits_k, pol.mode_k, last_dim=Dk, out_shape=(t_len, H, Dk)))
+            V.copy_(_dequant_slice(vpk, vsc, vzp, pol.bits_v, pol.mode_v, last_dim=Dv, out_shape=(t_len, H, Dv)))
+            if self._kvq_debug and (self._kvq_log_interval == 0):
+                logger.info("[KVQ] gather layer=%s block=%s t=[%s:%s) -> dequant T=%s",
+                            int(layer_idx), int(block_id), int(t_offset), int(t_offset + t_len), int(t_len))
+            return K, V
+        mgr._kvq_orig_gather = orig_gather
+        if hasattr(mgr, "gather_kv_slices"):
+            mgr.gather_kv_slices = _wrap_gather.__get__(mgr, mgr.__class__)
+        else:
+            mgr.gather = _wrap_gather.__get__(mgr, mgr.__class__)
+
+    return True
 
 # ======================
 # Quant helpers (reuse)

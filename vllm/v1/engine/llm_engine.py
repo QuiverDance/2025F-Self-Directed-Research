@@ -36,7 +36,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm.v1.engine.config import KVQuantConfig
 from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger, KVQuantLayerRecord
-from vllm.v1.attention.kv_cache_quant import PagedKVCacheQuantized
+from vllm.v1.attention.kv_cache_quant import attach_quant_to_block_manager
 
 import time as _time, uuid as _uuid, os as _os
 
@@ -268,7 +268,63 @@ class LLMEngine:
                  stat_loggers=stat_loggers,
                  multiprocess_mode=enable_multiprocessing)
 
+        # ---- [KVQ] Attach quantized-KV shim to BlockManager ----
+        # We do NOT change CUDA kernels. We store KV in quantized form per block
+        # and dequantize the requested slice into a scratch FP16 buffer at read.
+        try:
+            kvq_cfg = KVQuantConfig.from_args(engine_args)
+            if kvq_cfg and kvq_cfg.enable:
+                core = engine.engine_core
+                if hasattr(core, "engine_core"):
+                    core = core.engine_core
+                sched = getattr(core, "scheduler", None) or getattr(
+                    getattr(core, "model_executor", None), "scheduler", None)
+                if sched is not None:
+                    ok = attach_quant_to_block_manager(sched, kvq_cfg)
+                    if ok:
+                        try:
+                            setattr(engine, "_kvq_enabled", True)  # user introspection
+                        except Exception:
+                            pass
+                        logger.info("[KVQ] Quantized-KV attached to BlockManager (debug=%s, interval=%s).",
+                                    getattr(kvq_cfg, "debug", False),
+                                    getattr(kvq_cfg, "log_interval", 0))
+                    else:
+                        logger.warning("[KVQ] Failed to attach quant shim to BlockManager; using FP16 KV.")
+                else:
+                    logger.warning("[KVQ] scheduler not found; cannot attach quant shim.")
+        except Exception as e:
+            logger.exception("[KVQ] attach_quant_to_block_manager failed: %s", e)
+
         return engine
+
+    def kvq_status(self) -> dict:
+        """Return a lightweight runtime status of KV quantization (safe anytime)."""
+        try:
+            core = self.engine_core
+            if hasattr(core, "engine_core"):
+                core = core.engine_core
+            sched = getattr(core, "scheduler", None) or getattr(
+                getattr(core, "model_executor", None), "scheduler", None)
+            mgr = None
+            if sched is not None:
+                for name in ("kv_cache_manager", "block_manager", "cache_manager"):
+                    mgr = getattr(sched, name, None) or mgr
+            if mgr is None:
+                return {"enabled": False, "reason": "manager_not_found"}
+            store = getattr(mgr, "_kvq_store", None)
+            stats = getattr(mgr, "_kvq_stats", None)
+            return {
+                "enabled": bool(getattr(mgr, "_kvq_wrapped", False)),
+                "debug": bool(getattr(mgr, "_kvq_debug", False)),
+                "log_interval": int(getattr(mgr, "_kvq_log_interval", 0) or 0),
+                "num_quant_blocks": int(len(store) if isinstance(store, dict) else 0),
+                "bytes_packed": int(stats.get("bytes_packed", 0)) if isinstance(stats, dict) else 0,
+                "bytes_scales": int(stats.get("bytes_scales", 0)) if isinstance(stats, dict) else 0,
+                "bytes_zp": int(stats.get("bytes_zp", 0)) if isinstance(stats, dict) else 0,
+            }
+        except Exception as e:
+            return {"enabled": False, "reason": f"exception:{e}"
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()

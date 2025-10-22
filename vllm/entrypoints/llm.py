@@ -401,7 +401,7 @@ class LLM:
                             else:
                                 # DECODE: append new step, then dequant [Tcur-Twant:Tcur) into scratch
                                 kvq.append_kv(li, k_like.contiguous(), v_like.contiguous())
-                                Tcur = int(kvq.layers[li].T)
+                                Tcur = int(kvq.layers[li].T_total)
                                 start = max(0, Tcur - Twant)
                                 _ensure_scratch(self, Twant, H, D, k_like, v_like)
                                 kvq.dequant_slice_into(li, slice(start, Tcur), self._kvq_kbuf, self._kvq_vbuf)

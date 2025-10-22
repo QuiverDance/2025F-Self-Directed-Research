@@ -329,13 +329,13 @@ class LLM:
 
                 # 4) construct kvq
                 debug_flag = bool(kwargs.get("kv_quant_debug", False))
-                debug_interval = int(kwargs.get("kv_quant_log_interval", 128))
+                log_interval = int(kwargs.get("kv_quant_log_interval", 128))
                 kvq = PagedKVCacheQuantized(
                     num_layers=num_layers,
                     policies=policies,
                     device=device,
                     debug=debug_flag,
-                    debug_interval=debug_interval,
+                    log_interval=log_interval,
                 )
                 # attach handles for later access
                 setattr(self.llm_engine, "kv_quant", kvq)

@@ -129,7 +129,7 @@ class PagedKVCacheQuantized:
     """
 
     def __init__(self, num_layers: int, block_size: int, device: torch.device, policies: Dict[int, LayerPolicy],
-                 validate: bool = False, debug: bool = False) -> None:
+                 validate: bool = False, debug: bool = False, log_interval: int = 128) -> None:
         self.num_layers = num_layers
         self.block_size = int(block_size)
         self.device = device
@@ -138,6 +138,7 @@ class PagedKVCacheQuantized:
         }
         self.validate = bool(validate)
         self.debug = bool(debug)
+        self.log_interval = int(log_interval)
 
         # accounting
         self.bytes_packed_total = 0

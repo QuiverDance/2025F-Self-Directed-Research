@@ -128,7 +128,7 @@ class PagedKVCacheQuantized:
     - Layer policies (bits/mode/group_size) come from KVQuantConfig.
     """
 
-    def __init__(self, num_layers: int, block_size: int, device: torch.device, policies: Dict[int, LayerPolicy],
+    def __init__(self, num_layers: int, block_size: int = 16, device: torch.device, policies: Dict[int, LayerPolicy],
                  validate: bool = False, debug: bool = False, log_interval: int = 128) -> None:
         self.num_layers = num_layers
         self.block_size = int(block_size)

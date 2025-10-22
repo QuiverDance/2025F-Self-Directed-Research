@@ -326,7 +326,7 @@ class LLM:
                           if torch.cuda.is_available() else torch.device("cpu"))
 
                 # 3) layer policies: build a dict {layer_idx: LayerPolicy} instead of passing a function
-                policies = {li: kvq_cfg.policy_for(li) for li in range(int(n_layers))}
+                policies = {li: kvq_cfg.policy_for(li) for li in range(int(num_layers))}
 
                 # 4) construct kvq
                 debug_flag = bool(kwargs.get("kv_quant_debug", False))

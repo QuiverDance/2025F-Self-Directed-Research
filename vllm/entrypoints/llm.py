@@ -339,9 +339,8 @@ class LLM:
                 )
                 # attach handles for later access
                 setattr(self.llm_engine, "kv_quant", kvq)
-                if me is not None:
-                    setattr(me, "kv_quant", kvq)
-                    setattr(me, "kv_quant_cfg", kvq_cfg)
+                setattr(me, "kv_quant", kvq)
+                setattr(me, "kv_quant_cfg", kvq_cfg)
 
                 # 5) provide kvq handle to metrics collector
                 try:

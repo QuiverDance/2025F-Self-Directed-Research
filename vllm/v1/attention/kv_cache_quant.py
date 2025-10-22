@@ -56,36 +56,61 @@ def _unpack_bits(packed: torch.Tensor, bits: int, last_dim: int) -> torch.Tensor
     return out
 
 def _compute_groupwise_scale_zp(
-    x: torch.Tensor, bits: int, group_size: int, asymmetric: bool, reduce_over_time: bool
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+    x: torch.Tensor, bits: int, group_size: int, mode: str
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, bool, bool]:
     """
-    Compute per-group (scale[, zp]) for symmetric/asymmetric quant.
-    - If reduce_over_time=True  -> reduce over (T, group_size)  => per-channel stats
-    - Else (False)              -> reduce over (group_size)     => per-token stats
+    Compute per-group scale (and optional zp) for the given mode.
+    Supported modes:
+      - "symmetric_channel"   : scale [H,Dg], zp=None (use mid-offset at quant/dequant)
+      - "asymmetric_channel"  : scale [H,Dg], zp [H,Dg]
+      - "symmetric_token"     : scale [T,H,Dg], zp=None (use mid-offset)
+      - "asymmetric_token"    : scale [T,H,Dg], zp [T,H,Dg]
+
     Returns:
-      scale: fp16, shape [H,Dg] or [T,H,Dg]
-      zp   : uint8 (same shape) if asymmetric else None
-      Dg   : number of groups on D axis
+      scale, zp, Dg, is_symmetric(bool), is_per_token(bool)
     """
     T, H, D = x.shape
     Dg = _ceil_div(D, group_size)
-    # reshape to (..., Dg, group_size)
+
+    # Pad D to multiple of group_size for group-wise reduction
     pad = (-D) % group_size
     if pad:
         x = torch.nn.functional.pad(x, (0, pad))
-    xg = x.view(T, H, Dg, group_size)
-    if reduce_over_time:
-        xred = xg.float().amax(dim=(0, 3)) - xg.float().amin(dim=(0, 3))
-        # avoid zero-scale
-        scale = (xred / ((1 << bits) - 1)).clamp_min(1e-8).to(torch.float16)  # [H,Dg]
-        zp = None
-        return scale, zp, Dg
+    xg = x.view(T, H, Dg, group_size).float()
+
+    is_per_token = mode.endswith("_token")
+    is_symmetric = mode.startswith("symmetric")
+    Qmax_asym = (1 << bits) - 1
+    Qmax_sym  = (1 << (bits - 1)) - 1
+
+    if is_per_token:
+        # Reduce over group dimension only -> [T,H,Dg]
+        xmax = xg.amax(dim=3)
+        xmin = xg.amin(dim=3)
+        if is_symmetric:
+            # symmetric: use max-abs, zp implicit (mid-offset at use sites)
+            s = torch.maximum(xmax.abs(), xmin.abs())
+            scale = (s / max(Qmax_sym, 1)).clamp_min(1e-8).to(torch.float16)   # [T,H,Dg]
+            zp = None
+        else:
+            # asymmetric: use range and zp from min
+            rng = (xmax - xmin)
+            scale = (rng / max(Qmax_asym, 1)).clamp_min(1e-8).to(torch.float16)  # [T,H,Dg]
+            zp = torch.clamp((-xmin / scale).round(), 0, Qmax_asym).to(torch.uint8)
     else:
-        xmax = xg.float().amax(dim=3)
-        xmin = xg.float().amin(dim=3)
-        scale = ((xmax - xmin) / ((1 << bits) - 1)).clamp_min(1e-8).to(torch.float16)  # [T,H,Dg]
-        zp = torch.clamp((-xmin / scale).round(), 0, (1 << bits) - 1).to(torch.uint8)
-        return scale, zp, Dg
+        # per-channel: reduce over time AND group_size -> [H,Dg]
+        xmax = xg.amax(dim=(0, 3))
+        xmin = xg.amin(dim=(0, 3))
+        if is_symmetric:
+            s = torch.maximum(xmax.abs(), xmin.abs())
+            scale = (s / max(Qmax_sym, 1)).clamp_min(1e-8).to(torch.float16)   # [H,Dg]
+            zp = None
+        else:
+            rng = (xmax - xmin)
+            scale = (rng / max(Qmax_asym, 1)).clamp_min(1e-8).to(torch.float16)  # [H,Dg]
+            zp = torch.clamp((-xmin / scale).round(), 0, Qmax_asym).to(torch.uint8)
+
+    return scale, zp, Dg, is_symmetric, is_per_token
 
 @dataclass
 class LayerPolicy:
@@ -174,40 +199,56 @@ class PagedKVCacheQuantized:
         assert v.shape == (Tb, H, D)
 
         # --- K ---
-        asym_k = "asymmetric" in pol.mode_k
-        per_token_k = (pol.mode_k == "asymmetric_token")
-        scale_k, zp_k, Dg = _compute_groupwise_scale_zp(
-            k, pol.bits_k, pol.group_size, asymmetric=asym_k, reduce_over_time=not per_token_k
+        scale_k, zp_k, Dg, sym_k, per_token_k = _compute_groupwise_scale_zp(
+            k, pol.bits_k, pol.group_size, pol.mode_k
         )
-        # quantize / pack
+        # Quantize with proper padding/reshape/broadcast to groups
+        padD = (-D) % pol.group_size
+        k_pad = torch.nn.functional.pad(k, (0, padD)) if padD else k
+        k4 = k_pad.view(Tb, H, Dg, pol.group_size)         # [Tb,H,Dg,G]
         if per_token_k:
-            # scale_k: [T,H,Dg], zp_k: [T,H,Dg]
-            qk = torch.clamp((k.float() / scale_k.float()).round() + zp_k.float(), 0, (1 << pol.bits_k) - 1).to(torch.uint8)
-        else:
-            # scale_k: [H,Dg], symmetric/asymmetric-channel => zp is None or broadcastable const
-            if zp_k is None:
-                qk = torch.clamp((k.float() / scale_k.float()).round() + (1 << (pol.bits_k - 1)), 0, (1 << pol.bits_k) - 1).to(torch.uint8)
+            sk = scale_k[..., None].float()                # [T,H,Dg,1]
+            if sym_k:
+                offset = (1 << (pol.bits_k - 1))
+                qk4 = torch.clamp((k4.float() / sk).round() + offset, 0, (1 << pol.bits_k) - 1).to(torch.uint8)
             else:
-                qk = torch.clamp((k.float() / scale_k.float()).round() + zp_k.float(), 0, (1 << pol.bits_k) - 1).to(torch.uint8)
-        qk = qk.view(Tb, H, Dg, -1)  # last dim: group_size
-        qk_packed = _pack_bits(qk.view(Tb, H, -1), pol.bits_k)  # pack along last
+                zk = zp_k[..., None].float()               # [T,H,Dg,1]
+                qk4 = torch.clamp((k4.float() / sk).round() + zk, 0, (1 << pol.bits_k) - 1).to(torch.uint8)
+        else:
+            sk = scale_k[None, ..., None].float()          # [1,H,Dg,1]
+            if sym_k:
+                offset = (1 << (pol.bits_k - 1))
+                qk4 = torch.clamp((k4.float() / sk).round() + offset, 0, (1 << pol.bits_k) - 1).to(torch.uint8)
+            else:
+                zk = zp_k[None, ..., None].float()         # [1,H,Dg,1]
+                qk4 = torch.clamp((k4.float() / sk).round() + zk, 0, (1 << pol.bits_k) - 1).to(torch.uint8)
+        qk_packed = _pack_bits(qk4.view(Tb, H, -1), pol.bits_k)  # pack along last
 
         # --- V ---
-        asym_v = "asymmetric" in pol.mode_v
-        per_token_v = (pol.mode_v == "asymmetric_token")
-        scale_v, zp_v, Dg_v = _compute_groupwise_scale_zp(
-            v, pol.bits_v, pol.group_size, asymmetric=asym_v, reduce_over_time=not per_token_v
+        scale_v, zp_v, Dg_v, sym_v, per_token_v = _compute_groupwise_scale_zp(
+            v, pol.bits_v, pol.group_size, pol.mode_v
         )
         assert Dg_v == Dg
+        # Same padding/reshape/broadcast for V
+        v_pad = torch.nn.functional.pad(v, (0, padD)) if padD else v
+        v4 = v_pad.view(Tb, H, Dg, pol.group_size)         # [Tb,H,Dg,G]
         if per_token_v:
-            qv = torch.clamp((v.float() / scale_v.float()).round() + zp_v.float(), 0, (1 << pol.bits_v) - 1).to(torch.uint8)
-        else:
-            if zp_v is None:
-                qv = torch.clamp((v.float() / scale_v.float()).round() + (1 << (pol.bits_v - 1)), 0, (1 << pol.bits_v) - 1).to(torch.uint8)
+            sv = scale_v[..., None].float()
+            if sym_v:
+                offset_v = (1 << (pol.bits_v - 1))
+                qv4 = torch.clamp((v4.float() / sv).round() + offset_v, 0, (1 << pol.bits_v) - 1).to(torch.uint8)
             else:
-                qv = torch.clamp((v.float() / scale_v.float()).round() + zp_v.float(), 0, (1 << pol.bits_v) - 1).to(torch.uint8)
-        qv = qv.view(Tb, H, Dg, -1)
-        qv_packed = _pack_bits(qv.view(Tb, H, -1), pol.bits_v)
+                zv = zp_v[..., None].float()
+                qv4 = torch.clamp((v4.float() / sv).round() + zv, 0, (1 << pol.bits_v) - 1).to(torch.uint8)
+        else:
+            sv = scale_v[None, ..., None].float()
+            if sym_v:
+                offset_v = (1 << (pol.bits_v - 1))
+                qv4 = torch.clamp((v4.float() / sv).round() + offset_v, 0, (1 << pol.bits_v) - 1).to(torch.uint8)
+            else:
+                zv = zp_v[None, ..., None].float()
+                qv4 = torch.clamp((v4.float() / sv).round() + zv, 0, (1 << pol.bits_v) - 1).to(torch.uint8)
+        qv_packed = _pack_bits(qv4.view(Tb, H, -1), pol.bits_v)
 
         # allocate or grow storage in the block and write at [t0_blk:t0_blk+Tb)
         def _write(dst: Optional[torch.Tensor], src: torch.Tensor) -> torch.Tensor:
@@ -238,32 +279,43 @@ class PagedKVCacheQuantized:
 
         if per_token_k:
             blk.K_scale = _store_stats("K_scale", blk.K_scale, scale_k)
-            blk.K_zp    = _store_stats("K_zp",    blk.K_zp,    zp_k)
+            # symmetric_token: zp not stored (use mid-offset); asymmetric_token: store zp
+            if not sym_k:
+                blk.K_zp = _store_stats("K_zp", blk.K_zp, zp_k)
+            else:
+                blk.K_zp = None
         else:
-            # per-channel: save once at row 0, broadcast on dequant
+            # per-channel: store per-layer stats once; symmetric has no zp
             blk.K_scale = scale_k
-            blk.K_zp    = zp_k
+            blk.K_zp    = None if sym_k else zp_k
         if per_token_v:
             blk.V_scale = _store_stats("V_scale", blk.V_scale, scale_v)
-            blk.V_zp    = _store_stats("V_zp",    blk.V_zp,    zp_v)
+            if not sym_v:
+                blk.V_zp = _store_stats("V_zp", blk.V_zp, zp_v)
+            else:
+                blk.V_zp = None
         else:
             blk.V_scale = scale_v
-            blk.V_zp    = zp_v
+            blk.V_zp    = None if sym_v else zp_v
 
         # accounting
         self.bytes_packed_total += int(qk_packed.numel() + qv_packed.numel())
         if per_token_k:
             self.bytes_scales_total += int(scale_k.numel() * 2)  # fp16
-            self.bytes_zp_total     += int(zp_k.numel()) if zp_k is not None else 0
+            if not sym_k:
+                self.bytes_zp_total += int(zp_k.numel())
         else:
             self.bytes_scales_total += int(scale_k.numel() * 2)
-            self.bytes_zp_total     += int(scale_k.numel() if (zp_k is not None) else 0)
+            if not sym_k:
+                self.bytes_zp_total += int(scale_k.numel())
         if per_token_v:
             self.bytes_scales_total += int(scale_v.numel() * 2)
-            self.bytes_zp_total     += int(zp_v.numel()) if zp_v is not None else 0
+            if not sym_v:
+                self.bytes_zp_total += int(zp_v.numel())
         else:
             self.bytes_scales_total += int(scale_v.numel() * 2)
-            self.bytes_zp_total     += int(scale_v.numel() if (zp_v is not None) else 0)
+            if not sym_v:
+                self.bytes_zp_total += int(scale_v.numel())
 
     # --------- public API (called by wrapper) ---------
     def append_kv_prefill(self, li: int, K: torch.Tensor, V: torch.Tensor) -> None:
@@ -325,33 +377,41 @@ class PagedKVCacheQuantized:
             # --- unpack K ---
             kpk = blk.K_packed[off:off + n_blk]  # [Tb,H,Packed]
             k_unp = _unpack_bits(kpk, bits_k, Dg * pol.group_size).view(n_blk, st.H, Dg, pol.group_size)[..., :st.D]
-            if pol.mode_k == "asymmetric_token":
+            if pol.mode_k.endswith("_token"):
                 scale_k = blk.K_scale[off:off + n_blk]  # [Tb,H,Dg]
-                zp_k    = blk.K_zp[off:off + n_blk]
-                kf = (k_unp.float() - zp_k.float()) * scale_k.float()
-            else:
-                scale_k = blk.K_scale  # [H,Dg]
-                if blk.K_zp is None:   # symmetric-channel
+                if pol.mode_k.startswith("asymmetric"):
+                    zp_k = blk.K_zp[off:off + n_blk]
+                    kf = (k_unp.float() - zp_k.float()) * scale_k.float()
+                else:
                     zp = (1 << (bits_k - 1))
                     kf = (k_unp.float() - zp) * scale_k.float()
-                else:                   # asymmetric-channel
+            else:
+                scale_k = blk.K_scale  # [H,Dg]
+                if pol.mode_k.startswith("asymmetric"):
                     kf = (k_unp.float() - blk.K_zp.float()) * scale_k.float()
+                else:
+                    zp = (1 << (bits_k - 1))
+                    kf = (k_unp.float() - zp) * scale_k.float()
             Kdst[t_read:t_read + n_blk].copy_(kf.view(n_blk, st.H, st.D))
 
             # --- unpack V ---
             vpk = blk.V_packed[off:off + n_blk]
             v_unp = _unpack_bits(vpk, bits_v, Dg * pol.group_size).view(n_blk, st.H, Dg, pol.group_size)[..., :st.D]
-            if pol.mode_v == "asymmetric_token":
+            if pol.mode_v.endswith("_token"):
                 scale_v = blk.V_scale[off:off + n_blk]
-                zp_v    = blk.V_zp[off:off + n_blk]
-                vf = (v_unp.float() - zp_v.float()) * scale_v.float()
-            else:
-                scale_v = blk.V_scale
-                if blk.V_zp is None:
+                if pol.mode_v.startswith("asymmetric"):
+                    zp_v = blk.V_zp[off:off + n_blk]
+                    vf = (v_unp.float() - zp_v.float()) * scale_v.float()
+                else:
                     zp = (1 << (bits_v - 1))
                     vf = (v_unp.float() - zp) * scale_v.float()
-                else:
+            else:
+                scale_v = blk.V_scale
+                if pol.mode_v.startswith("asymmetric"):
                     vf = (v_unp.float() - blk.V_zp.float()) * scale_v.float()
+                else:
+                    zp = (1 << (bits_v - 1))
+                    vf = (v_unp.float() - zp) * scale_v.float()
             Vdst[t_read:t_read + n_blk].copy_(vf.view(n_blk, st.H, st.D))
 
             t_read += n_blk

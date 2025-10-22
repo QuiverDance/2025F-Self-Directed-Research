@@ -379,40 +379,44 @@ class PagedKVCacheQuantized:
             kpk = blk.K_packed[off:off + n_blk]  # [Tb,H,Packed]
             k_unp = _unpack_bits(kpk, bits_k, Dg * pol.group_size).view(n_blk, st.H, Dg, pol.group_size)[..., :st.D]
             if pol.mode_k.endswith("_token"):
-                scale_k = blk.K_scale[off:off + n_blk]  # [Tb,H,Dg]
+                # per-token stats: [Tb,H,Dg] -> add last singleton dim for group axis
+                scale_k = blk.K_scale[off:off + n_blk][..., None].float()  # [Tb,H,Dg,1]
                 if pol.mode_k.startswith("asymmetric"):
-                    zp_k = blk.K_zp[off:off + n_blk]
-                    kf = (k_unp.float() - zp_k.float()) * scale_k.float()
+                    zp_k = blk.K_zp[off:off + n_blk][..., None].float()     # [Tb,H,Dg,1]
+                    kf = (k_unp.float() - zp_k) * scale_k
                 else:
-                    zp = (1 << (bits_k - 1))
-                    kf = (k_unp.float() - zp) * scale_k.float()
+                    zp = float(1 << (bits_k - 1))                           # scalar mid-offset
+                    kf = (k_unp.float() - zp) * scale_k
             else:
-                scale_k = blk.K_scale  # [H,Dg]
+                # per-channel stats: [H,Dg] -> expand to [1,H,Dg,1]
+                scale_k = blk.K_scale[None, ..., None].float()              # [1,H,Dg,1]
                 if pol.mode_k.startswith("asymmetric"):
-                    kf = (k_unp.float() - blk.K_zp.float()) * scale_k.float()
+                    zp_k = blk.K_zp[None, ..., None].float()                # [1,H,Dg,1]
+                    kf = (k_unp.float() - zp_k) * scale_k
                 else:
-                    zp = (1 << (bits_k - 1))
-                    kf = (k_unp.float() - zp) * scale_k.float()
+                    zp = float(1 << (bits_k - 1))
+                    kf = (k_unp.float() - zp) * scale_k
             Kdst[t_read:t_read + n_blk].copy_(kf.view(n_blk, st.H, st.D))
 
             # --- unpack V ---
             vpk = blk.V_packed[off:off + n_blk]
             v_unp = _unpack_bits(vpk, bits_v, Dg * pol.group_size).view(n_blk, st.H, Dg, pol.group_size)[..., :st.D]
             if pol.mode_v.endswith("_token"):
-                scale_v = blk.V_scale[off:off + n_blk]
+                scale_v = blk.V_scale[off:off + n_blk][..., None].float()   # [Tb,H,Dg,1]
                 if pol.mode_v.startswith("asymmetric"):
-                    zp_v = blk.V_zp[off:off + n_blk]
-                    vf = (v_unp.float() - zp_v.float()) * scale_v.float()
+                    zp_v = blk.V_zp[off:off + n_blk][..., None].float()     # [Tb,H,Dg,1]
+                    vf = (v_unp.float() - zp_v) * scale_v
                 else:
-                    zp = (1 << (bits_v - 1))
-                    vf = (v_unp.float() - zp) * scale_v.float()
+                    zp = float(1 << (bits_v - 1))
+                    vf = (v_unp.float() - zp) * scale_v
             else:
-                scale_v = blk.V_scale
+                scale_v = blk.V_scale[None, ..., None].float()              # [1,H,Dg,1]
                 if pol.mode_v.startswith("asymmetric"):
-                    vf = (v_unp.float() - blk.V_zp.float()) * scale_v.float()
+                    zp_v = blk.V_zp[None, ..., None].float()                # [1,H,Dg,1]
+                    vf = (v_unp.float() - zp_v) * scale_v
                 else:
-                    zp = (1 << (bits_v - 1))
-                    vf = (v_unp.float() - zp) * scale_v.float()
+                    zp = float(1 << (bits_v - 1))
+                    vf = (v_unp.float() - zp) * scale_v
             Vdst[t_read:t_read + n_blk].copy_(vf.view(n_blk, st.H, st.D))
 
             t_read += n_blk

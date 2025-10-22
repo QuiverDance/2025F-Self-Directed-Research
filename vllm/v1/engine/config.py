@@ -36,7 +36,13 @@ class KVQuantConfig:
     log_path: Optional[str] = None
     log_interval: int = 128
     block_size: int = 16
-    default_policy: LayerPolicy = field(default_factory=lambda: LayerPolicy(**_DEFAULT_POLICY))
+    default_policy: LayerPolicy = field(default_factory=lambda: LayerPolicy(
+        bits_k=_DEFAULT_POLICY["K"],
+        bits_v=_DEFAULT_POLICY["V"],
+        group_size=_DEFAULT_POLICY["group_size"],
+        mode_k=_DEFAULT_POLICY["mode_k"],
+        mode_v=_DEFAULT_POLICY["mode_v"],
+    ))
     per_layer: Dict[int, LayerPolicy] = field(default_factory=dict)
 
     @classmethod
@@ -49,7 +55,7 @@ class KVQuantConfig:
         block_size = int(getattr(args, "kv_quant_block_size", 16))
 
         cfg_path = getattr(args, "kv_quant_config", None)
-        default_policy = LayerPolicy(**_DEFAULT_POLICY)
+        default_policy = LayerPolicy(bits_k=8, bits_v=8)
 
         per_layer: Dict[int, LayerPolicy] = {}
         if cfg_path:
@@ -81,7 +87,7 @@ class KVQuantConfig:
                 raise ValueError(f"default: invalid bits (K={default_policy.bits_k}, V={default_policy.bits_v})")
 
         return cls(enable=enable, fused_attn=fused, validate=validate,
-                   log_path=log_path, log_interval=log_interval, block_size=block_size,
+                   log_path=log_path, log_interval=log_interval, block_size=block_size
                    default_policy=default_policy, per_layer=per_layer)
 
     def policy_for(self, layer_idx: int) -> LayerPolicy:

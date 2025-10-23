@@ -279,10 +279,12 @@ class LLM:
         log_non_default_args(engine_args)
 
         # Create the Engine (autoselects V0 vs V1)
-        print("calling LLMEngine.from_engine_args")
-        print("LLMEngine: ", LLMEngine)
-        self.llm_engine = LLMEngine.from_engine_args(
+        # always use v1 engine for LLM class
+        from vllm.v1.engine.llm_engine import LLMEngine as LLMEngineV1
+        self.llm_engine = LLMEngineV1.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
+        # self.llm_engine = LLMEngine.from_engine_args(
+        #     engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()

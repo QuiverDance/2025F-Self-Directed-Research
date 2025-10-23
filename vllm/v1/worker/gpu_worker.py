@@ -442,6 +442,20 @@ class Worker(WorkerBase):
         # This is harmless if already attached; the shim is idempotent.
         self._kvq_attach_if_possible(origin="worker:execute_model_pre")
 
+        # ---- [KVQ] Debug: peek scheduler_output & manager to learn the actual IO plan
+        try:
+            self._kvq_debug_dump_scheduler_output(scheduler_output, max_items=3)
+        except Exception as e:
+            _logging.getLogger(__name__).warning("[KVQ] debug dump failed: %s", e)
+
+        # ---- [KVQ] Hydration: if this branch bypasses Python IO, materialize needed FP16 slices
+        # This is a best-effort shim that inspects common fields (block tables, token windows)
+        # and hydrates only the ranges that will be read by the upcoming kernel call.
+        try:
+            self._kvq_hydrate_before_forward(scheduler_output)
+        except Exception as e:
+            _logging.getLogger(__name__).warning("[KVQ] hydrate_before_forward failed: %s", e)
+
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
@@ -474,6 +488,13 @@ class Worker(WorkerBase):
 
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+
+        # ---- [KVQ] Quantize & seal: compress newly written tail tokens and free FP16 slots
+        try:
+            self._kvq_quantize_after_forward(scheduler_output, output)
+        except Exception as e:
+            _logging.getLogger(__name__).warning("[KVQ] quantize_after_forward failed: %s", e)
+
         return output
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
@@ -747,6 +768,107 @@ class Worker(WorkerBase):
 
         except Exception as e:
             _logging.getLogger(__name__).exception("[KVQ] worker attach error (%s): %s", origin, e)
+    
+    # -------------------------
+    # [KVQ] INTROSPECTION LOGS
+    # -------------------------
+    def _kvq_debug_dump_scheduler_output(self, so, max_items: int = 3) -> None:
+        """Log key fields from SchedulerOutput so we know what to hydrate/quantize."""
+        log = _logging.getLogger(__name__)
+        fields = []
+        for name in dir(so):
+            if name.startswith("_"):
+                continue
+            try:
+                val = getattr(so, name)
+            except Exception:
+                continue
+            # Heuristics: only show potentially relevant fields
+            if any(k in name for k in ("block", "kv", "slot", "token", "table", "window", "range", "seq")):
+                shape = None
+                try:
+                    if hasattr(val, "shape"):
+                        shape = tuple(int(x) for x in val.shape)
+                    elif hasattr(val, "__len__"):
+                        shape = (len(val),)
+                except Exception:
+                    pass
+                fields.append((name, type(val).__name__, shape))
+        if fields:
+            head = ", ".join([f"{n}:{t}{'' if s is None else s}" for n,t,s in fields[:max_items]])
+            log.info("[KVQ] SO fields: %s%s", head, " ..." if len(fields)>max_items else "")
+
+    # ---------------------------------
+    # [KVQ] EXECUTE-TIME HYDRATION/SEAL
+    # ---------------------------------
+    def _kvq_hydrate_before_forward(self, so) -> None:
+        """Best-effort hydration: dequantize only the windows the kernel is about to read.
+        This branch does NOT touch CUDA and keeps BlockPool intact.
+        """
+        cfg = self._kvq_get_cfg()
+        if not (cfg and getattr(cfg, "enable", False)):
+            return
+        mr = getattr(self, "model_runner", None)
+        if mr is None:
+            return
+        # Manager candidates
+        mgr = None
+        for nm in ("kv_cache_manager", "block_manager", "cache_manager", "kv_cache"):
+            mgr = getattr(mr, nm, None) or mgr
+        if mgr is None:
+            return
+        log = _logging.getLogger(__name__)
+        # Try to extract read plan (best-effort; tolerate missing fields)
+        # Common patterns across vLLM branches:
+        plans = []
+        for name in ("block_tables", "block_table", "read_block_tables", "decode_block_tables"):
+            tbl = getattr(so, name, None)
+            if tbl is not None:
+                plans.append(("block_tables", tbl))
+                break
+        t_windows = getattr(so, "token_windows", None) or getattr(so, "read_token_windows", None)
+        # Call into manager-side shim if present
+        hydrate = getattr(mgr, "kvq_hydrate", None)
+        if callable(hydrate):
+            try:
+                hydrate(plans=plans, token_windows=t_windows, policy=cfg)
+                log.info("[KVQ] hydrate: invoked kvq_hydrate on manager (plans=%s, windows=%s)",
+                         [p[0] for p in plans], type(t_windows).__name__ if t_windows is not None else None)
+                return
+            except Exception as e:
+                log.warning("[KVQ] hydrate via manager failed: %s", e)
+        # Fallback: if attach_quant_to_block_manager stored a sidecar, try using it
+        store = getattr(mgr, "_kvq_store", None)
+        if isinstance(store, dict) and store:
+            log.info("[KVQ] hydrate: sidecar present (%d items); kernel will see FP16 for hot windows.", len(store))
+        else:
+            log.info("[KVQ] hydrate: no-op (no sidecar & no manager hook).")
+
+    def _kvq_quantize_after_forward(self, so, output) -> None:
+        """Best-effort sealing: quantize newly written tail tokens and free FP16 pages."""
+        cfg = self._kvq_get_cfg()
+        if not (cfg and getattr(cfg, "enable", False)):
+            return
+        mr = getattr(self, "model_runner", None)
+        if mr is None:
+            return
+        mgr = None
+        for nm in ("kv_cache_manager", "block_manager", "cache_manager", "kv_cache"):
+            mgr = getattr(mr, nm, None) or mgr
+        if mgr is None:
+            return
+        log = _logging.getLogger(__name__)
+        seal = getattr(mgr, "kvq_quantize_and_seal", None)
+        if callable(seal):
+            try:
+                seal(policy=cfg)  # Manager computes "what changed" this step internally if possible
+                log.info("[KVQ] seal: invoked kvq_quantize_and_seal on manager.")
+                return
+            except Exception as e:
+                log.warning("[KVQ] seal via manager failed: %s", e)
+        # Fallback: just log; if attach path collected nothing, there's nothing to seal
+        store = getattr(mgr, "_kvq_store", None)
+        log.info("[KVQ] seal: sidecar_items=%d (no-op fallback).", 0 if not isinstance(store, dict) else len(store))
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,

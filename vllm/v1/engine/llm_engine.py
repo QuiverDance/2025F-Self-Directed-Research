@@ -251,7 +251,6 @@ class LLMEngine:
         enable_multiprocessing: bool = False,
     ) -> "LLMEngine":
         """Creates an LLM engine from the engine arguments."""
-        print("LLMEngine.from_engine_args called", flush=True)
         # Create the engine configs.
         vllm_config = engine_args.create_engine_config(usage_context)
         executor_class = Executor.get_class(vllm_config)
@@ -273,7 +272,6 @@ class LLMEngine:
         # and dequantize the requested slice into a scratch FP16 buffer at read.
         try:
             kvq_cfg = KVQuantConfig.from_args(engine_args)
-            print("[KVQDBG] KVQuantConfig:", kvq_cfg.__dict__, flush=True)
             if kvq_cfg and kvq_cfg.enable:
                 core = engine.engine_core
                 if hasattr(core, "engine_core"):
@@ -315,6 +313,8 @@ class LLMEngine:
                 return {"enabled": False, "reason": "manager_not_found"}
             store = getattr(mgr, "_kvq_store", None)
             stats = getattr(mgr, "_kvq_stats", None)
+            probe = getattr(mgr, "_kvq_probe_counts", None)
+            wrapped = getattr(mgr, "_kvq_probe_wrapped", None)
             return {
                 "enabled": bool(getattr(mgr, "_kvq_wrapped", False)),
                 "debug": bool(getattr(mgr, "_kvq_debug", False)),
@@ -323,6 +323,8 @@ class LLMEngine:
                 "bytes_packed": int(stats.get("bytes_packed", 0)) if isinstance(stats, dict) else 0,
                 "bytes_scales": int(stats.get("bytes_scales", 0)) if isinstance(stats, dict) else 0,
                 "bytes_zp": int(stats.get("bytes_zp", 0)) if isinstance(stats, dict) else 0,
+                "probe_wrapped": list(wrapped) if isinstance(wrapped, list) else [],
+                "probe_counts": dict(probe) if isinstance(probe, dict) else {},
             }
         except Exception as e:
             return {"enabled": False, "reason": f"exception:{e}"}

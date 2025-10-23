@@ -57,6 +57,50 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
     mgr._kvq_stats = {"bytes_packed": 0, "bytes_scales": 0, "bytes_zp": 0}
     mgr._kvq_token_count = 0
 
+    # ---- Probe: discover which methods are actually called on this manager
+    mgr._kvq_probe_counts = {}
+    mgr._kvq_probe_wrapped = []
+    # Candidate names seen across vLLM branches (writer/readers).
+    writer_candidates = [
+        "append_kv", "append", "write", "write_kv", "append_slots",
+        "commit_kv", "commit", "update_kv", "copy_tokens_to_kv",
+        "copy_tokens_to_kv_cache", "add_kv", "add"
+    ]
+    reader_candidates = [
+        "gather_kv_slices", "gather", "read", "get_kv_slices",
+        "materialize_kv", "fetch_kv", "materialize"
+    ]
+    def _wrap_probe(obj, name):
+        if not hasattr(obj, name):
+            return False
+        orig = getattr(obj, name)
+        if not callable(orig):
+            return False
+        if getattr(orig, "_kvq_probe", False):
+            return True
+        def _probe_wrapper(*args, **kwargs):
+            cnt = obj._kvq_probe_counts.get(name, 0) + 1
+            obj._kvq_probe_counts[name] = cnt
+            if mgr._kvq_debug and cnt <= 5:  # log first few hits to avoid spam
+                logger.info("[KVQ/PROBE] %s.%s call #%d", obj.__class__.__name__, name, cnt)
+            return orig(*args, **kwargs)
+        _probe_wrapper._kvq_probe = True
+        setattr(obj, name, _probe_wrapper)
+        obj._kvq_probe_wrapped.append(name)
+        return True
+    # Try to wrap probes on manager itself
+    hit = 0
+    for nm in writer_candidates + reader_candidates:
+        hit += int(_wrap_probe(mgr, nm))
+    if getattr(scheduler, "__class__", None):
+        # Some repos dispatch via scheduler methods; probe them too.
+        for nm in writer_candidates + reader_candidates:
+            hit += int(_wrap_probe(scheduler, nm))
+    if mgr._kvq_debug:
+        logger.info("[KVQ/PROBE] Installed on %s: %s (total=%d)",
+                    mgr.__class__.__name__, ", ".join(mgr._kvq_probe_wrapped), hit)
+
+
     def _key(layer_idx: int, block_id: int):
         return (int(layer_idx), int(block_id))
 
@@ -130,6 +174,13 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
             mgr.gather_kv_slices = _wrap_gather.__get__(mgr, mgr.__class__)
         else:
             mgr.gather = _wrap_gather.__get__(mgr, mgr.__class__)
+
+    # If neither append nor gather were wrapped, warn once (likely direct-kernel path).
+    if (orig_append is None) and (orig_gather is None) and mgr._kvq_debug:
+        logger.warning("[KVQ] Neither append/gather hooks found on %s. "
+                       "Your branch may bypass Python for KV IO. "
+                       "Check PROBE counters to locate the write/read path.",
+                       mgr.__class__.__name__)
 
     return True
 

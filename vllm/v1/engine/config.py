@@ -89,9 +89,9 @@ class KVQuantConfig:
                 raise ValueError(f"default: invalid bits (K={default_policy.bits_k}, V={default_policy.bits_v})")
 
         if debug:
-            print(f"KV Quantization Config: enable={enable}, fused_attn={fused}, validate={validate}, "
+            print(f"[KVQ]KV Quantization Config: enable={enable}, fused_attn={fused}, validate={validate}, "
                   f"log_path={log_path}, log_interval={log_interval}, block_size={block_size}")
-            print(f"Default Policy: K={default_policy.bits_k}, V={default_policy.bits_v}, "
+            print(f"[KVQ]Default Policy: K={default_policy.bits_k}, V={default_policy.bits_v}, "
                   f"group_size={default_policy.group_size}, mode_k={default_policy.mode_k}, mode_v={default_policy.mode_v}")
             for li, p in per_layer.items():
                 print(f" Layer {li}: K={p.bits_k}, V={p.bits_v}, group_size={p.group_size}, "

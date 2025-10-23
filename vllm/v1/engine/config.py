@@ -35,7 +35,7 @@ class KVQuantConfig:
     validate: bool = False
     log_path: Optional[str] = None
     log_interval: int = 128
-    kv_quant_debug: bool = False
+    debug: bool = False
     block_size: int = 16
     default_policy: LayerPolicy = field(default_factory=lambda: LayerPolicy(
         bits_k=_DEFAULT_POLICY["K"],
@@ -96,7 +96,7 @@ class KVQuantConfig:
             for li, p in per_layer.items():
                 print(f" Layer {li}: K={p.bits_k}, V={p.bits_v}, group_size={p.group_size}, "
                       f"mode_k={p.mode_k}, mode_v={p.mode_v}")
-                      
+
         return cls(enable=enable, fused_attn=fused, validate=validate,
                    log_path=log_path, log_interval=log_interval, debug=debug, block_size=block_size,
                    default_policy=default_policy, per_layer=per_layer)

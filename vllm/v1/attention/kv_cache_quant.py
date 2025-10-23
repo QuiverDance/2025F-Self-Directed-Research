@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List
 import torch
 import math
-import logging
+import logging, os
 from types import MethodType
 
 # Reuse the public record type for optional layer-wise logging (already used by metrics)
@@ -24,7 +24,7 @@ def kvq_new_task():
 # ==========================================================
 # Quant attach shim for vLLM BlockManager (paged KV backend)
 # ==========================================================
-def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
+def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None, origin: str = "unknown") -> bool:
     """Attach a write/read shim to the BlockManager so that KV is stored
     in quantized form per layer/block, while the BlockPool scheduler,
     allocation and eviction logic remain unchanged.
@@ -56,6 +56,8 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
     mgr._kvq_store = {}
     mgr._kvq_stats = {"bytes_packed": 0, "bytes_scales": 0, "bytes_zp": 0}
     mgr._kvq_token_count = 0
+    mgr._kvq_origin = origin
+    mgr._kvq_pid = os.getpid()
 
     # ---- Probe: discover which methods are actually called on this manager
     mgr._kvq_probe_counts = {}
@@ -63,12 +65,14 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
     # Candidate names seen across vLLM branches (writer/readers).
     writer_candidates = [
         "append_kv", "append", "write", "write_kv", "append_slots",
-        "commit_kv", "commit", "update_kv", "copy_tokens_to_kv",
-        "copy_tokens_to_kv_cache", "add_kv", "add"
+        "commit_kv", "commit", "update_kv",
+        "copy_tokens_to_kv", "copy_tokens_to_kv_cache",
+        "add_kv", "add", "commit_block", "flush_block"
     ]
     reader_candidates = [
         "gather_kv_slices", "gather", "read", "get_kv_slices",
-        "materialize_kv", "fetch_kv", "materialize"
+        "materialize_kv", "fetch_kv", "materialize",
+        "read_kv", "gather_cached_kv"
     ]
     def _wrap_probe(obj, name):
         if not hasattr(obj, name):
@@ -97,8 +101,10 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
         for nm in writer_candidates + reader_candidates:
             hit += int(_wrap_probe(scheduler, nm))
     if mgr._kvq_debug:
-        logger.info("[KVQ/PROBE] Installed on %s: %s (total=%d)",
-                    mgr.__class__.__name__, ", ".join(mgr._kvq_probe_wrapped), hit)
+        logger.info(
+            "[KVQ/PROBE] Installed on %s: %s (total=%d, origin=%s, pid=%s)",
+            mgr.__class__.__name__, ", ".join(mgr._kvq_probe_wrapped), hit, origin, mgr._kvq_pid
+        )
 
 
     def _key(layer_idx: int, block_id: int):
@@ -136,10 +142,10 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
             self._kvq_token_count += int(k.shape[0])
             if self._kvq_debug and (self._kvq_log_interval == 0 or
                                     (self._kvq_token_count % self._kvq_log_interval == 0)):
-                logger.info("[KVQ] append layer=%s block=%s T+=%s stats(packed=%d, scales=%d, zp=%d) items=%d",
+                logger.info("[KVQ] append layer=%s block=%s T+=%s stats(packed=%d, scales=%d, zp=%d) items=%d (where=%s,pid=%s)",
                             int(layer_idx), int(block_id), int(k.shape[0]),
                             self._kvq_stats["bytes_packed"], self._kvq_stats["bytes_scales"],
-                            self._kvq_stats["bytes_zp"], len(self._kvq_store))
+                            self._kvq_stats["bytes_zp"], len(self._kvq_store), self._kvq_origin, self._kvq_pid)
             return {"block_id": int(block_id), "kvq": True}
         mgr._kvq_orig_append = orig_append
         if hasattr(mgr, "append_kv"):
@@ -166,8 +172,9 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
             K.copy_(_dequant_slice(kpk, ksc, kzp, pol.bits_k, pol.mode_k, last_dim=Dk, out_shape=(t_len, H, Dk)))
             V.copy_(_dequant_slice(vpk, vsc, vzp, pol.bits_v, pol.mode_v, last_dim=Dv, out_shape=(t_len, H, Dv)))
             if self._kvq_debug and (self._kvq_log_interval == 0):
-                logger.info("[KVQ] gather layer=%s block=%s t=[%s:%s) -> dequant T=%s",
-                            int(layer_idx), int(block_id), int(t_offset), int(t_offset + t_len), int(t_len))
+                logger.info("[KVQ] gather layer=%s block=%s t=[%s:%s) -> dequant T=%s (where=%s,pid=%s)",
+                            int(layer_idx), int(block_id), int(t_offset), int(t_offset + t_len), int(t_len),
+                            self._kvq_origin, self._kvq_pid)
             return K, V
         mgr._kvq_orig_gather = orig_gather
         if hasattr(mgr, "gather_kv_slices"):
@@ -177,10 +184,10 @@ def attach_quant_to_block_manager(scheduler, kvq_cfg, policy_fn=None) -> bool:
 
     # If neither append nor gather were wrapped, warn once (likely direct-kernel path).
     if (orig_append is None) and (orig_gather is None) and mgr._kvq_debug:
-        logger.warning("[KVQ] Neither append/gather hooks found on %s. "
+        logger.warning("[KVQ] Neither append/gather hooks found on %s (origin=%s,pid=%s). "
                        "Your branch may bypass Python for KV IO. "
                        "Check PROBE counters to locate the write/read path.",
-                       mgr.__class__.__name__)
+                       mgr.__class__.__name__, origin, mgr._kvq_pid)
 
     return True
 

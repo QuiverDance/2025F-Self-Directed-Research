@@ -39,7 +39,7 @@ from vllm.v1.metrics.kv_quant import KVQuantMetricsLogger, KVQuantLayerRecord
 from vllm.v1.attention.kv_cache_quant import attach_quant_to_block_manager
 
 import time as _time, uuid as _uuid, os as _os
-
+import os as _os
 # --- KV instrumentation (request-scoped, unified) ---
 from vllm.instrumentation.kv_metrics import (
     KVMetricsCollector,
@@ -279,15 +279,16 @@ class LLMEngine:
                 sched = getattr(core, "scheduler", None) or getattr(
                     getattr(core, "model_executor", None), "scheduler", None)
                 if sched is not None:
-                    ok = attach_quant_to_block_manager(sched, kvq_cfg)
+                    ok = attach_quant_to_block_manager(sched, kvq_cfg, origin="driver")
                     if ok:
                         try:
                             setattr(engine, "_kvq_enabled", True)  # user introspection
                         except Exception:
                             pass
-                        logger.info("[KVQ] Quantized-KV attached to BlockManager (debug=%s, interval=%s).",
+                        logger.info("[KVQ] Quantized-KV attached to BlockManager (debug=%s, interval=%s, pid=%s, where=driver).",
                                     getattr(kvq_cfg, "debug", False),
-                                    getattr(kvq_cfg, "log_interval", 0))
+                                    getattr(kvq_cfg, "log_interval", 0),
+                                    _os.getpid())
                     else:
                         logger.warning("[KVQ] Failed to attach quant shim to BlockManager; using FP16 KV.")
                 else:
@@ -315,7 +316,7 @@ class LLMEngine:
             stats = getattr(mgr, "_kvq_stats", None)
             probe = getattr(mgr, "_kvq_probe_counts", None)
             wrapped = getattr(mgr, "_kvq_probe_wrapped", None)
-            return {
+            out = {
                 "enabled": bool(getattr(mgr, "_kvq_wrapped", False)),
                 "debug": bool(getattr(mgr, "_kvq_debug", False)),
                 "log_interval": int(getattr(mgr, "_kvq_log_interval", 0) or 0),
@@ -326,6 +327,10 @@ class LLMEngine:
                 "probe_wrapped": list(wrapped) if isinstance(wrapped, list) else [],
                 "probe_counts": dict(probe) if isinstance(probe, dict) else {},
             }
+            # Heuristic: if everything is zero/empty but enabled=True, likely attached in driver not worker.
+            if out["enabled"] and out["num_quant_blocks"] == 0 and not out["probe_wrapped"] and not out["probe_counts"]:
+                out["note"] = "kvq hooks likely attached in driver only; worker not patched"
+            return out
         except Exception as e:
             return {"enabled": False, "reason": f"exception:{e}"}
 

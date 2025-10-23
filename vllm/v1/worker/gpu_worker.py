@@ -34,6 +34,10 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
 
+from vllm.v1.engine.config import KVQuantConfig
+from vllm.v1.attention.kv_cache_quant import attach_quant_to_block_manager
+import os as _os, logging as _logging
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -201,6 +205,10 @@ class Worker(WorkerBase):
         self.model_runner: GPUModelRunner = GPUModelRunner(
             self.vllm_config, self.device)
 
+        # ---- [KVQ] Try attaching quantized-KV in WORKER right after model runner is ready.
+        # Note: At this moment, KV cache manager may not exist yet; we try again later, too.
+        self._kvq_attach_if_possible(origin="worker:init_device_after_model_runner")
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -317,6 +325,9 @@ class Worker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+        # ---- [KVQ] KV cache is now initialized; attach again (this is when the manager usually exists).
+        self._kvq_attach_if_possible(origin="worker:initialize_from_config_after_init_kv")
+
     def compile_or_warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
         # but users still want to compile for better performance,
@@ -426,6 +437,11 @@ class Worker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[Union[ModelRunnerOutput, AsyncModelRunnerOutput]]:
+
+        # ---- [KVQ] Lazy attach just before real execution (last chance).
+        # This is harmless if already attached; the shim is idempotent.
+        self._kvq_attach_if_possible(origin="worker:execute_model_pre")
+
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
@@ -674,6 +690,63 @@ class Worker(WorkerBase):
     def shutdown(self) -> None:
         self.model_runner.ensure_kv_transfer_shutdown()
 
+    # =========================
+    # [KVQ] helper: worker side
+    # =========================
+    def _kvq_get_cfg(self) -> Optional[KVQuantConfig]:
+        """Fetch KVQuantConfig from vllm_config or build from engine_args."""
+        try:
+            cfg = getattr(self.vllm_config, "kv_quant_config", None)
+            if cfg is None:
+                cfg = KVQuantConfig.from_args(getattr(self.vllm_config, "engine_args", None))
+            return cfg
+        except Exception:
+            return None
+
+    def _kvq_attach_if_possible(self, origin: str = "worker") -> None:
+        """Attempt to attach quantized-KV shim in the worker process.
+        We prefer passing a holder object that *contains* the manager, e.g., model_runner.
+        If not available yet, we try again at later call sites.
+        """
+        try:
+            cfg = self._kvq_get_cfg()
+            if not (cfg and getattr(cfg, "enable", False)):
+                return
+
+            mr = getattr(self, "model_runner", None)
+            if mr is None:
+                return
+
+            log = _logging.getLogger(__name__)
+
+            # 1) Try attaching with model_runner as the holder (common case when it exposes kv_cache_manager).
+            ok = attach_quant_to_block_manager(mr, cfg, origin=origin)
+            log.info("[KVQ] worker attach on model_runner: %s (origin=%s, pid=%s)",
+                     "OK" if ok else "MISS", origin, _os.getpid())
+            if ok:
+                return
+
+            # 2) If model_runner does not expose it yet, try wrapping an explicit manager if present.
+            for nm in ("kv_cache_manager", "block_manager", "cache_manager"):
+                mgrobj = getattr(mr, nm, None)
+                if mgrobj is not None:
+                    class _Shim:  # minimal holder exposing kv_cache_manager for the attach() shim
+                        pass
+                    shim = _Shim()
+                    setattr(shim, "kv_cache_manager", mgrobj)
+                    ok2 = attach_quant_to_block_manager(shim, cfg, origin=f"{origin}|shim:{nm}")
+                    log.info("[KVQ] worker attach via shim(%s): %s (origin=%s, pid=%s)",
+                             nm, "OK" if ok2 else "MISS", origin, _os.getpid())
+                    if ok2:
+                        return
+
+            # 3) Last resort: try self (Worker) in case the branch exposes a manager here.
+            ok3 = attach_quant_to_block_manager(self, cfg, origin=f"{origin}|worker_self")
+            log.info("[KVQ] worker attach on Worker: %s (origin=%s, pid=%s)",
+                     "OK" if ok3 else "MISS", origin, _os.getpid())
+
+        except Exception as e:
+            _logging.getLogger(__name__).exception("[KVQ] worker attach error (%s): %s", origin, e)
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,

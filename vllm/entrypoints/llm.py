@@ -280,6 +280,7 @@ class LLM:
 
         # Create the Engine (autoselects V0 vs V1)
         print("calling LLMEngine.from_engine_args")
+        print("LLMEngine: ", LLMEngine)
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.engine_class = type(self.llm_engine)

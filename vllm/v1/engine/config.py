@@ -35,6 +35,7 @@ class KVQuantConfig:
     validate: bool = False
     log_path: Optional[str] = None
     log_interval: int = 128
+    kv_quant_debug: bool = False
     block_size: int = 16
     default_policy: LayerPolicy = field(default_factory=lambda: LayerPolicy(
         bits_k=_DEFAULT_POLICY["K"],
@@ -52,6 +53,7 @@ class KVQuantConfig:
         validate = bool(getattr(args, "kv_quant_validate", False))
         log_path = getattr(args, "kv_quant_log_path", None)
         log_interval = int(getattr(args, "kv_quant_log_interval", 128))
+        debug = bool(getattr(args, "kv_quant_debug", False))
         block_size = int(getattr(args, "kv_quant_block_size", 16))
 
         cfg_path = getattr(args, "kv_quant_config", None)
@@ -86,8 +88,17 @@ class KVQuantConfig:
             if default_policy.bits_k not in _VALID_BITS or default_policy.bits_v not in _VALID_BITS:
                 raise ValueError(f"default: invalid bits (K={default_policy.bits_k}, V={default_policy.bits_v})")
 
+        if debug:
+            print(f"KV Quantization Config: enable={enable}, fused_attn={fused}, validate={validate}, "
+                  f"log_path={log_path}, log_interval={log_interval}, block_size={block_size}")
+            print(f"Default Policy: K={default_policy.bits_k}, V={default_policy.bits_v}, "
+                  f"group_size={default_policy.group_size}, mode_k={default_policy.mode_k}, mode_v={default_policy.mode_v}")
+            for li, p in per_layer.items():
+                print(f" Layer {li}: K={p.bits_k}, V={p.bits_v}, group_size={p.group_size}, "
+                      f"mode_k={p.mode_k}, mode_v={p.mode_v}")
+                      
         return cls(enable=enable, fused_attn=fused, validate=validate,
-                   log_path=log_path, log_interval=log_interval, block_size=block_size,
+                   log_path=log_path, log_interval=log_interval, debug=debug, block_size=block_size,
                    default_policy=default_policy, per_layer=per_layer)
 
     def policy_for(self, layer_idx: int) -> LayerPolicy:

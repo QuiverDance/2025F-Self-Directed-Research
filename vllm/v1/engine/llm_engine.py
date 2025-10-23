@@ -273,6 +273,7 @@ class LLMEngine:
         # and dequantize the requested slice into a scratch FP16 buffer at read.
         try:
             kvq_cfg = KVQuantConfig.from_args(engine_args)
+            print("[KVQDBG] KVQuantConfig:", kvq_cfg.__dict__, flush=True)
             if kvq_cfg and kvq_cfg.enable:
                 core = engine.engine_core
                 if hasattr(core, "engine_core"):

@@ -324,7 +324,7 @@ class LLMEngine:
                 "bytes_zp": int(stats.get("bytes_zp", 0)) if isinstance(stats, dict) else 0,
             }
         except Exception as e:
-            return {"enabled": False, "reason": f"exception:{e}}"
+            return {"enabled": False, "reason": f"exception:{e}"}
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()

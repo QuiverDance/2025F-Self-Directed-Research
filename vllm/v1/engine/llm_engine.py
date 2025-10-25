@@ -35,11 +35,11 @@ from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm._debug import dprint
+from vllm.v1.metrics.kv_request_meter import kv_meter
 
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
-
 
 class LLMEngine:
     """Legacy LLMEngine for backwards compatibility."""
@@ -124,7 +124,10 @@ class LLMEngine:
         if not multiprocess_mode:
             # for v0 compatibility
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
-
+        
+        # for kv cache metrics
+        kv_meter.attach(self)
+        
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
@@ -211,6 +214,8 @@ class LLMEngine:
         priority: int = 0,
     ) -> None:
         dprint('path', 'LLMEngine.add_request')
+        kv_meter.note_request_added(request_id)
+        
         # Validate the request_id type.
         if not isinstance(request_id, str):
             raise TypeError(
@@ -234,6 +239,9 @@ class LLMEngine:
         parent_req = ParentRequest(request_id, params)
         for idx in range(n):
             request_id, params = parent_req.get_child_info(idx)
+            
+            kv_meter.note_request_added(request_id)
+            
             child_request = request if idx == n - 1 else copy(request)
             child_request.request_id = request_id
             child_request.sampling_params = params
@@ -253,6 +261,38 @@ class LLMEngine:
 
         # 1) Get EngineCoreOutput from the EngineCore.
         outputs = self.engine_core.get_output()
+        
+        # ---- KV metrics (per-step) ----
+        # Active request IDs in this step
+        try:
+            active_ids = {o.request_id for o in outputs.outputs}
+        except Exception:
+            active_ids = set()
+        
+        # Percent usage in [0,1] — v1 canonical field
+        sched = getattr(outputs, "scheduler_stats", None)
+        kv_usage = getattr(sched, "kv_cache_usage", None)
+        
+        # TOTAL BLOCKS
+        try:
+            total_blocks = int(getattr(self.cache_config, "num_gpu_blocks"))
+            if total_blocks <= 0:
+                total_blocks = None
+        except Exception:
+            total_blocks = None
+        
+        # Timestamp (fallback to wall time)
+        ts = getattr(outputs, "timestamp", None) or time.monotonic()
+
+        # Record snapshot (bytes are computed as usage × total_bytes if total_blocks known)
+        kv_meter.note_step(
+            active_req_ids=active_ids,
+            kv_usage_perc=kv_usage,
+            ts=ts,
+            used_blocks=None,            # Not needed
+            total_blocks=total_blocks,   
+        )
+        # -------------------------------
 
         # 2) Process EngineCoreOutputs.
         iteration_stats = IterationStats() if self.log_stats else None
@@ -263,14 +303,53 @@ class LLMEngine:
 
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+        
+        # ---- KV metrics: finalize finished requests ----
+        try:
+            for ro in processed_outputs.request_outputs:
+                # Many RequestOutput implementations expose "finished" boolean.
+                if getattr(ro, "finished", False):
+                    kv_meter.note_request_finished(ro.request_id, ts)
+        except Exception:
+            # Be robust against any structural differences.
+            pass
+        # ------------------------------------------------
 
         # 4) Record stats
         if self.stat_logger is not None:
             assert outputs.scheduler_stats is not None
             self.stat_logger.record(scheduler_stats=outputs.scheduler_stats,
                                     iteration_stats=iteration_stats)
-
+        
         return processed_outputs.request_outputs
+    
+    def dump_sched_schema(sched) -> str:
+        """Return a human readable list of available fields on scheduler_stats."""
+        try:
+            import dataclasses
+            if dataclasses.is_dataclass(sched):
+                return "scheduler_stats fields: " + ", ".join(sorted(dataclasses.asdict(sched).keys()))
+        except Exception:
+            pass
+        # pydantic v1/v2 or simple object
+        for m in ("model_dump", "dict"):
+            fn = getattr(sched, m, None)
+            if callable(fn):
+                try:
+                    keys = list(fn().keys())
+                    return f"scheduler_stats fields ({m}): " + ", ".join(sorted(keys))
+                except Exception:
+                    continue
+        # generic fallback
+        names = []
+        for k in dir(sched):
+            if k.startswith("_"):
+                continue
+            v = getattr(sched, k)
+            if not callable(v):
+                names.append(k)
+        return "scheduler_stats attrs: " + ", ".join(sorted(names))
+
 
     def get_vllm_config(self):
         return self.vllm_config
@@ -333,6 +412,15 @@ class LLMEngine:
                        args: tuple = (),
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+    
+    # ---- KV meter helpers (run-scoped) ----
+    def reset_kv_meter(self, run_id: Optional[str] = None) -> None:
+        """Call this at the beginning of a benchmark run."""
+        kv_meter.reset(run_id)
+
+    def get_kv_meter_summary(self) -> dict:
+        """Call this after the benchmark run to collect per-request + summary."""
+        return kv_meter.get_run_summary()
 
     def __del__(self):
         if dp_group := getattr(self, "dp_group", None):

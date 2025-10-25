@@ -57,6 +57,8 @@ from vllm.utils import Counter, Device, as_iter, is_list_of
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
 from vllm._debug import set_flags, dprint
+from vllm.v1.metrics.kv_request_meter import kv_meter
+import time
 
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
@@ -1584,6 +1586,10 @@ class LLM:
         priority: int = 0,
     ) -> None:
         request_id = str(next(self.request_counter))
+
+        # enqueue time for TTFT
+        kv_meter.note_request_added(request_id, ts=time.monotonic())
+
         self.llm_engine.add_request(
             request_id,
             prompt,

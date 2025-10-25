@@ -32,6 +32,7 @@ from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
 
+from vllm._debug import dprint, set_flags
 logger = init_logger(__name__)
 
 
@@ -165,6 +166,8 @@ class Worker(LocalOrDistributedWorkerBase):
             self._sleep_saved_buffers = {}
 
     def init_device(self) -> None:
+        dprint('path', 'Worker.init_device',
+            device=self.device_config.device.type)
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -195,6 +198,7 @@ class Worker(LocalOrDistributedWorkerBase):
         set_random_seed(self.model_config.seed)
 
     def load_model(self):
+        dprint('path', 'Worker.load_model start')
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, (
@@ -344,6 +348,8 @@ class Worker(LocalOrDistributedWorkerBase):
 
         This also warms up the model, which may record CUDA graphs.
         """
+        dprint('path', 'Worker.initialize_cache',
+            cache_conf=str(getattr(self, 'cache_config', None)))
         raise_if_cache_size_invalid(
             num_gpu_blocks, self.cache_config.block_size,
             self.cache_config.is_attention_free,
@@ -363,6 +369,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self._warm_up_model()
 
     def _init_cache_engine(self):
+        dprint('path', 'Worker._init_cache_engine (before create)')
         assert self.cache_config.num_gpu_blocks is not None
         self.cache_engine = [
             CacheEngine(self.cache_config, self.model_config,
@@ -396,6 +403,7 @@ class Worker(LocalOrDistributedWorkerBase):
 
         bind_kv_cache(self.compilation_config.static_forward_context,
                       self.gpu_cache, shared_kv_cache_layers)
+        dprint('path', 'Worker._init_cache_engine (after create)')
 
     def _warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
@@ -477,6 +485,8 @@ class Worker(LocalOrDistributedWorkerBase):
     @torch.inference_mode()
     def prepare_worker_input(
             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
+        dprint('path', 'Worker.prepare_worker_input')
+
         virtual_engine = execute_model_req.virtual_engine
         num_steps = execute_model_req.num_steps
         num_seq_groups = len(execute_model_req.seq_group_metadata_list)
@@ -506,6 +516,8 @@ class Worker(LocalOrDistributedWorkerBase):
 
     @torch.inference_mode()
     def execute_worker(self, worker_input: WorkerInput) -> None:
+        dprint('path', 'Worker.execute_worker enter')
+
         virtual_engine = worker_input.virtual_engine
         # Issue cache operations.
         if (worker_input.blocks_to_swap_in is not None
@@ -566,6 +578,7 @@ class Worker(LocalOrDistributedWorkerBase):
         execute_model_req: ExecuteModelRequest,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Optional[List[SamplerOutput]]:
+        dprint('path', 'Worker._execute_model_spmd')
         if execute_model_req is not None:
             new_seq_group_metadata_list = self._get_cached_seq_group_metadata(
                 execute_model_req.seq_group_metadata_list,
@@ -611,6 +624,9 @@ def init_worker_distributed_environment(
     distributed_init_method: Optional[str] = None,
     local_rank: int = -1,
 ) -> None:
+    dprint('path', 'Worker.init_worker_distributed_environment',
+       rank=rank,
+       local_rank=local_rank) 
     """Initialize the distributed environment."""
     parallel_config = vllm_config.parallel_config
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)

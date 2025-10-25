@@ -62,6 +62,7 @@ from vllm.worker.model_runner_base import (
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
+from vllm._debug import dprint
 logger = init_logger(__name__)
 
 LORA_WARMUP_RANK = 8
@@ -1598,6 +1599,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         num_steps: int = 1,
         **kwargs,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        dprint('path', 'ModelRunner.execute_model')
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
 

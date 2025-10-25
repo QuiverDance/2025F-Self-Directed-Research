@@ -43,6 +43,7 @@ from vllm.v1.outputs import (AsyncModelRunnerOutput, DraftTokenIds,
                              ModelRunnerOutput)
 from vllm.worker.worker_base import WorkerWrapperBase
 
+from vllm._debug import dprint, set_flags
 logger = init_logger(__name__)
 
 
@@ -175,7 +176,7 @@ class MultiprocExecutor(Executor):
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
-
+        dprint('path', 'MultiprocExecutor.execute_model')
         if not self.has_connector:
             # get output only from a single worker (output_rank)
             (output, ) = self.collective_rpc(
@@ -241,6 +242,7 @@ class MultiprocExecutor(Executor):
             def get_response(w: WorkerProcHandle,
                              dequeue_timeout: Optional[float] = None,
                              cancel_event: Optional[threading.Event] = None):
+                dprint('path', 'MultiprocExecutor.get_response')
                 status, result = w.worker_response_mq.dequeue(
                     timeout=dequeue_timeout, cancel=cancel_event)
 
@@ -302,6 +304,7 @@ class MultiprocExecutor(Executor):
 
     def shutdown(self):
         """Properly shut down the executor and its workers"""
+        dprint('path', 'MultiprocExecutor.shutdown')
         if not getattr(self, 'shutting_down', False):
             self.shutting_down = True
 
@@ -445,6 +448,8 @@ class WorkerProc:
         input_shm_handle,  # Receive SchedulerOutput
         shared_worker_lock: LockType,
     ) -> UnreadyWorkerProcHandle:
+        dprint('path', 'WorkerProc.make_worker_process')
+
         context = get_mp_context()
         # (reader, writer)
         reader, writer = context.Pipe(duplex=False)
@@ -525,6 +530,7 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """ Worker initialization and execution loops.
         This runs a background process """
+        dprint('path', 'WorkerProc.worker_main start')
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
@@ -651,6 +657,7 @@ class WorkerProc:
 
     def worker_busy_loop(self, cancel: Optional[threading.Event] = None):
         """Main busy loop for Multiprocessing Workers"""
+        dprint('path', 'worker_busy_loop')
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 cancel=cancel)

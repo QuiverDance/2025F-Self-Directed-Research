@@ -18,6 +18,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
+from vllm._debug import dprint, set_flags
+
 FailureCallback = Callable[[], None]
 
 
@@ -100,9 +102,11 @@ class Executor(ExecutorBase):
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        dprint('path', 'Executor.execute_model dispatch')
+
         output = self.collective_rpc("execute_model",
                                      args=(scheduler_output, ),
-                                     non_block=non_block)
+                                     non_block=non_block) 
         return output[0]
 
     def execute_dummy_batch(self) -> None:

@@ -41,7 +41,7 @@ from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
                     init_vllm_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
 from .vision import get_vision_encoder_info
-
+from vllm._debug import dprint
 
 class Mistral3ImagePixelInputs(TensorSchema):
     """
@@ -81,6 +81,7 @@ class Mistral3PatchMerger(nn.Module):
 
     def forward(self, image_features: torch.Tensor,
                 image_sizes: torch.Tensor) -> torch.Tensor:
+        dprint('path', 'Mistral3.PatchMerger.forward enter')
         image_sizes = [(image_size[0] // self.patch_size,
                         image_size[1] // self.patch_size)
                        for image_size in image_sizes]
@@ -140,6 +141,7 @@ class Mistral3MultiModalProjector(nn.Module):
 
     def forward(self, image_features: torch.Tensor,
                 image_sizes: torch.Tensor) -> torch.Tensor:
+        dprint('path', 'Mistral3.Mistral3MultiModalProjector.forward enter')
         image_features = self.norm(image_features)
         image_features = self.patch_merger(image_features, image_sizes)
         hidden_states, _ = self.linear_1(image_features)
@@ -585,6 +587,7 @@ class Mistral3ForConditionalGeneration(nn.Module, SupportsLoRA,
         Info:
             [`Mistral3ImagePixelInputs`][vllm.model_executor.models.mistral3.Mistral3ImagePixelInputs]
         """
+        dprint('path', 'Mistral3.Mistral3ForConditionalGeneration.forward enter')
         if intermediate_tensors is not None:
             inputs_embeds = None
 

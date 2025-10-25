@@ -50,6 +50,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
+from vllm._debug import dprint
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
@@ -67,6 +68,7 @@ class EngineCore:
                  log_stats: bool,
                  executor_fail_callback: Optional[Callable] = None):
 
+        dprint('path', 'EngineCore.__init__ start')
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
         load_general_plugins()
@@ -279,7 +281,7 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
+        dprint('path', 'EngineCore.step start')
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -319,6 +321,11 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        dprint('path', 'EngineCore.step_with_batch_queue enter',
+               has_requests=self.scheduler.has_requests(),
+               qsize=(len(batch_queue) if batch_queue else 0),
+               qcap=self.batch_queue_size)
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -327,11 +334,15 @@ class EngineCore:
         model_executed = False
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            dprint('path', 'EngineCore.step_with_batch_queue scheduled',
+                   tot_tokens=scheduler_output.total_num_scheduled_tokens)
             future = self.model_executor.execute_model(scheduler_output,
                                                        non_block=True)
             batch_queue.appendleft(
                 (future, scheduler_output))  # type: ignore[arg-type]
-
+            
+            dprint('path', 'EngineCore.step_with_batch_queue queued batch',
+                   qsize=len(batch_queue))
             model_executed = scheduler_output.total_num_scheduled_tokens > 0
             if model_executed and len(batch_queue) < self.batch_queue_size \
                 and not batch_queue[-1][0].done():
@@ -347,12 +358,16 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
+        dprint('path', 'EngineCore.step_with_batch_queue waiting result',
+               qsize=len(batch_queue))
+
         model_output = self.execute_model_with_error_logging(
             lambda _: future.result(), scheduler_output)
+        dprint('path', 'EngineCore.step_with_batch_queue got result')
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)
-
+        dprint('path', 'EngineCore.step_with_batch_queue updated scheduler')
         return engine_core_outputs, model_executed
 
     def shutdown(self):

@@ -479,6 +479,9 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
+    
+    # Debug Option
+    path_debug: bool = False
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -938,7 +941,11 @@ class EngineArgs:
                                 **vllm_kwargs["additional_config"])
         vllm_group.add_argument('--structured-outputs-config',
                                 **vllm_kwargs["structured_outputs_config"])
-
+        
+        # For Debug
+        debug_group = parser.add_argument_group("Print Debug messages")
+        debug_group.add_argument("--path-debug", action="store_true",
+                        help="Enable Debug mode for path tracing.")
         # Other arguments
         parser.add_argument('--disable-log-stats',
                             action='store_true',

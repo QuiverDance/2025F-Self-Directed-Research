@@ -29,6 +29,7 @@ from vllm.v1.structured_output.backend_outlines import (
 from vllm.v1.structured_output.backend_xgrammar import (
     validate_xgrammar_grammar)
 
+from vllm._debug import dprint
 logger = init_logger(__name__)
 
 
@@ -150,7 +151,7 @@ class Processor:
         Validate supported SamplingParam.
         Should raise ValueError if unsupported for API Server.
         """
-
+        dprint('path', 'Processor._validate_params')
         if isinstance(params, PoolingParams):
             return
 
@@ -334,7 +335,7 @@ class Processor:
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> tuple[Optional[str], EngineCoreRequest]:
-
+        dprint('path', 'Processor.process_inputs enter')
         # TODO(woosuk): Support pooling models.
         self._validate_lora(lora_request)
         self._validate_params(params)
@@ -429,7 +430,8 @@ class Processor:
                         modality=modality,
                         identifier=decoder_mm_hashes[modality][idx],
                         mm_position=decoder_mm_positions[modality][idx]))
-
+        
+        dprint('path', 'Processor.process_inputs exit')
         return decoder_inputs.get("prompt"), EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=decoder_inputs["prompt_token_ids"],
@@ -446,6 +448,7 @@ class Processor:
         )
 
     def _validate_model_inputs(self, inputs: ProcessorInputs):
+        dprint('path', 'Processor._validate_model_inputs')
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(inputs)
 
         if encoder_inputs is not None:

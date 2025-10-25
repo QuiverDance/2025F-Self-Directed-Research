@@ -37,6 +37,7 @@ from vllm.v1.engine.utils import (CoreEngineActorManager,
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
+from vllm._debug import dprint
 logger = init_logger(__name__)
 
 AnyFuture = Union[asyncio.Future[Any], Future[Any]]
@@ -417,6 +418,7 @@ class MPClient(EngineCoreClient):
         log_stats: bool,
         client_addresses: Optional[dict[str, str]] = None,
     ):
+        dprint('path', 'vllm/v1/engine/core_client/MPClient.__init__ start')
         self.vllm_config = vllm_config
         # Serialization setup.
         self.encoder = MsgpackEncoder()
@@ -639,11 +641,20 @@ class SyncMPClient(MPClient):
 
                     frames = out_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
+                    
+                    dprint('path', 'Core->Client frames received')
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
+                        dprint('path', 'Core->Client utility_output')
                         _process_utility_output(outputs.utility_output,
                                                 utility_results)
                     else:
+                        n_out = len(outputs.outputs or [])
+                        done = len(outputs.finished_requests or [])
+                        stats = outputs.scheduler_stats is not None
+                        req_ids = [o.request_id for o in (outputs.outputs or [])[:4]]
+                        dprint('path', 'Core->Client outputs decoded',
+                            num=n_out, finished=done, has_stats=stats, reqs=req_ids)
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
                 outputs_queue.put_nowait(e)
@@ -673,6 +684,7 @@ class SyncMPClient(MPClient):
         return outputs
 
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):
+        dprint('path', 'SyncMPClient._send_input', req_type=getattr(request_type, "name", str(request_type)))
         self.ensure_alive()
         self.free_pending_messages()
         # (Identity, RequestType, SerializedRequest)

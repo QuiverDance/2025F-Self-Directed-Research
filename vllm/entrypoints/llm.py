@@ -56,6 +56,8 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, Device, as_iter, is_list_of
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
+from vllm._debug import set_flags, dprint
+
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
 
@@ -261,7 +263,14 @@ class LLM:
                 structured_outputs_instance = structured_outputs_config
         else:
             structured_outputs_instance = StructuredOutputsConfig()
+        
 
+        # Debug flags (boolean only)
+        self._path_debug: bool = bool(kwargs.pop('path_debug', False))
+        set_flags(path=self._path_debug)
+        dprint('path', 'LLM.__init__ start', runner=runner, convert=convert)
+        
+        dprint('path', 'LLM.__init__ constructing EngineArgs and LLMEngine(v1)')
         engine_args = EngineArgs(
             model=model,
             runner=runner,
@@ -296,9 +305,10 @@ class LLM:
         )
 
         log_non_default_args(engine_args)
-
-        # Create the Engine (autoselects V0 vs V1)
-        self.llm_engine = LLMEngine.from_engine_args(
+        
+        # Create the Engine (V1)
+        from vllm.v1.engine.llm_engine import LLMEngine as LLMEngineV1
+        self.llm_engine = LLMEngineV1.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.engine_class = type(self.llm_engine)
 
@@ -382,6 +392,8 @@ class LLM:
             considered legacy and may be deprecated in the future. You should
             instead pass them via the `inputs` parameter.
         """
+        dprint('path', 'LLM.generate start', num_prompts=len(prompts) if isinstance(prompts, Sequence) else 1)
+
         model_config = self.llm_engine.model_config
         runner_type = model_config.runner_type
         if runner_type != "generate":
@@ -1478,6 +1490,7 @@ class LLM:
         lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
         priority: Optional[list[int]] = None,
     ) -> None:
+        dprint('path', 'LLM._validate_and_add_requests')
         if isinstance(prompts, (str, dict)):
             # Convert a single prompt to a list.
             prompts = [prompts]
@@ -1585,6 +1598,7 @@ class LLM:
         *,
         use_tqdm: Union[bool, Callable[..., tqdm]] = True
     ) -> list[Union[RequestOutput, PoolingRequestOutput]]:
+        dprint('path', 'LLM._run_engine enter loop')
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()

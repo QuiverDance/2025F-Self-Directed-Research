@@ -26,6 +26,7 @@ from vllm.worker.model_runner_base import (BroadcastableModelInput,
                                            ModelRunnerBase,
                                            ModelRunnerInputBase)
 
+from vllm._debug import dprint, set_flags
 logger = init_logger(__name__)
 
 
@@ -54,6 +55,8 @@ class WorkerBase:
         self.compilation_config = vllm_config.compilation_config
         from vllm.platforms import current_platform
         self.current_platform = current_platform
+        
+        dprint('path', 'WorkerBase.__init__', **self._debug_snapshot())
 
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
@@ -72,6 +75,9 @@ class WorkerBase:
 
     def load_model(self) -> None:
         """Load model onto target device."""
+        dprint('path', 'WorkerBase.load_model begin',
+           model=getattr(model_config, 'model', None),
+           dtype=str(getattr(model_config, 'dtype', None)))
         raise NotImplementedError
 
     def execute_model(
@@ -86,10 +92,12 @@ class WorkerBase:
         You can stop the loop by executing a driver worker with an empty output.
         See `stop_remote_worker_execution_loop` for more details.
         """
+        dprint('path', 'WorkerBase.start_worker_execution_loop begin')
         with self.current_platform.inference_mode():
             while True:
                 output = self.execute_model(execute_model_req=None)
                 if output is None:
+                    dprint('path', 'WorkerBase.start_worker_execution_loop stop')
                     return None
 
     def determine_num_available_blocks(self) -> Tuple[int, int]:
@@ -131,8 +139,23 @@ class WorkerBase:
 
     def shutdown(self) -> None:
         """Clean up resources held by the worker."""
+        dprint('path', 'WorkerBase.shutdown')
         return
-
+    
+    def _debug_snapshot(self) -> dict[str, Any]:
+        pc = self.parallel_config
+        dc = self.device_config
+        mc = self.model_config
+        cc = self.cache_config
+        return {
+            "device": getattr(dc, "device", None),
+            "tp": getattr(pc, "tensor_parallel_size", None),
+            "dp": getattr(pc, "data_parallel_size", None),
+            "pp": getattr(pc, "pipeline_parallel_size", None),
+            "dtype": str(getattr(mc, "dtype", None)),
+            "max_model_len": getattr(mc, "max_model_len", None),
+            "kv_block_size": getattr(cc, "block_size", None),
+        }
 
 class DelegateWorkerBase(WorkerBase):
     """

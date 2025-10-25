@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm._debug import dprint
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -696,6 +697,7 @@ class FlexAttentionImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        dprint('path', 'v1/attention/backends/flex_attetnion.py.FlexAttentionImpl start')
         assert output is not None, "Output tensor must be provided."
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(

@@ -34,6 +34,8 @@ from vllm.v1.metrics.loggers import (PrometheusStatLogger, StatLoggerBase,
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm._debug import dprint
+
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -53,6 +55,7 @@ class LLMEngine:
         use_cached_outputs: bool = False,
         multiprocess_mode: bool = False,
     ) -> None:
+        dprint('path', 'LLMEngine.__init__ start', executor=executor_class.__name__)
         if not envs.VLLM_USE_V1:
             raise ValueError(
                 "Using V1 LLMEngine, but envs.VLLM_USE_V1=False. "
@@ -69,7 +72,9 @@ class LLMEngine:
         self.observability_config = vllm_config.observability_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
-
+        
+        dprint('path', 'LLMEngine.__init__ configs set')
+        
         self.log_stats = log_stats
         self.stat_logger: Optional[StatLoggerBase] = None
         if self.log_stats:
@@ -80,6 +85,7 @@ class LLMEngine:
         parallel_config = vllm_config.parallel_config
         if not multiprocess_mode and parallel_config.data_parallel_size > 1:
             self.dp_group = parallel_config.stateless_init_dp_group()
+            dprint('path', 'LLMEngine.__init__ dp_group initialized')
         else:
             self.dp_group = None
         self.should_execute_dummy_batch = False
@@ -106,6 +112,7 @@ class LLMEngine:
             self.output_processor.tracer = tracer
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
+        dprint('path', 'LLMEngine.__init__ creating EngineCore')
         self.engine_core = EngineCoreClient.make_client(
             multiprocess_mode=multiprocess_mode,
             asyncio_mode=False,
@@ -153,7 +160,8 @@ class LLMEngine:
         if envs.VLLM_ENABLE_V1_MULTIPROCESSING:
             logger.debug("Enabling multiprocessing for LLMEngine.")
             enable_multiprocessing = True
-
+        
+        print("[Path Check] create the LLMEngine at vllm/v1/engine/llm_engine.py")
         # Create the LLMEngine.
         return cls(vllm_config=vllm_config,
                    executor_class=executor_class,
@@ -202,6 +210,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
     ) -> None:
+        dprint('path', 'LLMEngine.add_request')
         # Validate the request_id type.
         if not isinstance(request_id, str):
             raise TypeError(
@@ -236,7 +245,7 @@ class LLMEngine:
             self.engine_core.add_request(child_request)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
-
+        dprint('path', 'LLMEngine.step start')
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()

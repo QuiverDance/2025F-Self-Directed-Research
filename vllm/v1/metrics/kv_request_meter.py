@@ -237,6 +237,10 @@ class KVRequestMeter:
         with self._lock:
             if req_id not in self._reqs:
                 self._reqs[req_id] = _ReqStat(req_id=req_id, t_add=now)
+    
+    def get_open_request_ids(self) -> set[str]:
+        with self._lock:
+            return {rid for rid, rs in self._reqs.items() if rs.t_finish is None}
 
     def note_step(
         self,
@@ -258,8 +262,7 @@ class KVRequestMeter:
 
             # Ensure capacity math ready
             self._ensure_bytes_per_block()
-
-            cur_bytes = None
+            
             if kv_usage_perc is not None and self._total_bytes is not None:
                 cur_bytes = float(kv_usage_perc) * float(self._total_bytes)
 
@@ -321,7 +324,6 @@ class KVRequestMeter:
                     avg_bytes = rs.auc_bytes / dur
                 
                 ttft = None
-                print(f"t_first_seen:{rs.t_first_seen}, t_add:{rs.t_add}")
                 if rs.t_first_seen is not None:
                     ttft = max(0.0, rs.t_first_seen - rs.t_add)
                 

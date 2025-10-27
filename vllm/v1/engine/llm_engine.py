@@ -36,6 +36,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm._debug import dprint
 from vllm.v1.metrics.kv_request_meter import kv_meter
+import time
 
 logger = init_logger(__name__)
 
@@ -268,11 +269,16 @@ class LLMEngine:
             active_ids = {o.request_id for o in outputs.outputs}
         except Exception:
             active_ids = set()
-        
+        if not active_ids:
+            try:
+                active_ids = kv_meter.get_open_request_ids()
+            except Exception:
+                active_ids = set()
+
         # Percent usage in [0,1] — v1 canonical field
         sched = getattr(outputs, "scheduler_stats", None)
         kv_usage = getattr(sched, "kv_cache_usage", None)
-        
+
         # TOTAL BLOCKS
         try:
             total_blocks = int(getattr(self.cache_config, "num_gpu_blocks"))
@@ -281,15 +287,17 @@ class LLMEngine:
         except Exception:
             total_blocks = None
         
+        used_blocks = None # Not Used
+
         # Timestamp (fallback to wall time)
         ts = getattr(outputs, "timestamp", None) or time.monotonic()
-
+        
         # Record snapshot (bytes are computed as usage × total_bytes if total_blocks known)
         kv_meter.note_step(
             active_req_ids=active_ids,
             kv_usage_perc=kv_usage,
             ts=ts,
-            used_blocks=None,            # Not needed
+            used_blocks=used_blocks, # Not Used
             total_blocks=total_blocks,   
         )
         # -------------------------------
@@ -305,11 +313,14 @@ class LLMEngine:
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
         
         # ---- KV metrics: finalize finished requests ----
+        
         try:
             for ro in processed_outputs.request_outputs:
                 # Many RequestOutput implementations expose "finished" boolean.
                 if getattr(ro, "finished", False):
                     kv_meter.note_request_finished(ro.request_id, ts)
+            for rid in processed_outputs.reqs_to_abort:
+                kv_meter.note_request_finished(rid, ts)
         except Exception:
             # Be robust against any structural differences.
             pass

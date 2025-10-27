@@ -265,7 +265,7 @@ class KVRequestMeter:
             
             if kv_usage_perc is not None and self._total_bytes is not None:
                 cur_bytes = float(kv_usage_perc) * float(self._total_bytes)
-
+            
             for rid in active_req_ids:
                 rs = self._reqs.get(rid)
                 if rs is None:
@@ -312,6 +312,12 @@ class KVRequestMeter:
             self._ensure_bytes_per_block()
 
             per_req: List[dict] = []
+            # pooled (ratio-of-sums) accumulators
+            total_auc_kv = 0.0
+            total_auc_bytes = 0.0
+            total_dur = 0.0
+            total_decode_time = 0.0
+            total_decode_steps = 0
             for rs in self._reqs.values():
                 dur = None
                 if rs.t_first_seen is not None and rs.t_finish is not None:
@@ -322,6 +328,9 @@ class KVRequestMeter:
                 if dur and dur > 0:
                     avg_kv = rs.auc_kv / dur
                     avg_bytes = rs.auc_bytes / dur
+                    total_auc_kv += rs.auc_kv
+                    total_auc_bytes += rs.auc_bytes
+                    total_dur += dur
                 
                 ttft = None
                 if rs.t_first_seen is not None:
@@ -334,6 +343,8 @@ class KVRequestMeter:
                 if decode_time is not None and decode_time > 0 and decode_steps > 0:
                     decode_tps = decode_steps / decode_time
                     decode_tpt_ms = 1000.0 * (decode_time / decode_steps)
+                    total_decode_time += decode_time
+                    total_decode_steps += decode_steps
 
                 peak_kv_bytes = rs.max_bytes if rs.max_bytes is not None else None
                 peak_kv_usage = rs.max_kv if rs.max_kv is not None else None
@@ -383,16 +394,21 @@ class KVRequestMeter:
                     ttft_list = [x["ttft_seconds"] for x in per_req if x["ttft_seconds"] is not None]
                     tps_list  = [x["decode_tps"] for x in per_req if x["decode_tps"] is not None]
                     tpt_list  = [x["decode_tpt_ms"] for x in per_req if x["decode_tpt_ms"] is not None]
-
+                    # --- pooled / overall (ratio-of-sums) primary, fallback to simple mean if not computable ---
+                    pooled_kv_usage_avg = (total_auc_kv / total_dur) if total_dur > 0 else (st.mean(avg_perc) if avg_perc else None)
+                    pooled_kv_bytes_avg = (total_auc_bytes / total_dur) if total_dur > 0 else (st.mean(avg_bytes) if avg_bytes else None)
+                    pooled_decode_tps   = (total_decode_steps / total_decode_time) if total_decode_time > 0 else (st.mean(tps_list) if tps_list else None)
+                    pooled_decode_tpt   = (1000.0 * (total_decode_time / total_decode_steps)) if total_decode_steps > 0 else (st.mean(tpt_list) if tpt_list else None)
+                    
                     agg = {
                         "num_requests": n,
-                        "kv_usage_max_mean": st.mean(max_perc) if max_perc else None,
-                        "kv_usage_avg_time_weighted_mean": st.mean(avg_perc) if avg_perc else None,
-                        "kv_bytes_max_mean": st.mean(max_bytes) if max_bytes else None,
-                        "kv_bytes_avg_time_weighted_mean": st.mean(avg_bytes) if avg_bytes else None,
+                        "kv_usage_max": max(max_perc) if max_perc else None,
+                        "kv_usage_avg_time_weighted_mean": pooled_kv_usage_avg,
+                        "kv_bytes_max": max(max_bytes) if max_bytes else None,
+                        "kv_bytes_avg_time_weighted_mean": pooled_kv_bytes_avg,
                         "ttft_mean_seconds": st.mean(ttft_list) if ttft_list else None,
-                        "decode_tps_mean": st.mean(tps_list) if tps_list else None,
-                        "decode_tpt_ms_mean": st.mean(tpt_list) if tpt_list else None,
+                        "decode_tps_mean": pooled_decode_tps,
+                        "decode_tpt_ms_mean": pooled_decode_tpt,
                     }
                 except Exception:
                     agg = {"num_requests": n}
@@ -406,8 +422,8 @@ class KVRequestMeter:
                 "per_request": per_req,
                 "aggregate": agg,
             }
-            if agg.get("kv_bytes_max_mean") is not None:
-                out["aggregate"]["kv_bytes_max_mean_readable"] = _human_bytes(agg["kv_bytes_max_mean"])
+            if agg.get("kv_bytes_max") is not None:
+                out["aggregate"]["kv_bytes_max_readable"] = _human_bytes(agg["kv_bytes_max"])
             if agg.get("kv_bytes_avg_time_weighted_mean") is not None:
                 out["aggregate"]["kv_bytes_avg_time_weighted_mean_readable"] = _human_bytes(
                     agg["kv_bytes_avg_time_weighted_mean"]
@@ -418,7 +434,6 @@ class KVRequestMeter:
                 out["aggregate"]["decode_tpt_ms_mean_readable"] = f"{agg['decode_tpt_ms_mean']:.2f} ms/token"
             if agg.get("decode_tps_mean") is not None:
                 out["aggregate"]["decode_tps_mean_readable"] = f"{agg['decode_tps_mean']:.2f} tok/s"
-
             return out
 
 

@@ -165,7 +165,6 @@ class LLMEngine:
             logger.debug("Enabling multiprocessing for LLMEngine.")
             enable_multiprocessing = True
         
-        print("[Path Check] create the LLMEngine at vllm/v1/engine/llm_engine.py")
         # Create the LLMEngine.
         return cls(vllm_config=vllm_config,
                    executor_class=executor_class,
@@ -278,7 +277,7 @@ class LLMEngine:
         # Percent usage in [0,1] — v1 canonical field
         sched = getattr(outputs, "scheduler_stats", None)
         kv_usage = getattr(sched, "kv_cache_usage", None)
-
+        
         # TOTAL BLOCKS
         try:
             total_blocks = int(getattr(self.cache_config, "num_gpu_blocks"))

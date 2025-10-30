@@ -309,8 +309,8 @@ class LLM:
         log_non_default_args(engine_args)
         
         # Create the Engine (V1)
-        from vllm.v1.engine.llm_engine import LLMEngine as LLMEngineV1
-        self.llm_engine = LLMEngineV1.from_engine_args(
+        # from vllm.v1.engine.llm_engine import LLMEngine as LLMEngineV1
+        self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.engine_class = type(self.llm_engine)
 

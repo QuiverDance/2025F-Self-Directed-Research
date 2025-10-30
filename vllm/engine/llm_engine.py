@@ -55,6 +55,8 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import Counter, Device, resolve_obj_by_qualname, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.worker.model_runner_base import InputProcessingError
+from vllm.engine.kv_request_meter import kv_meter
+import inspect
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -354,6 +356,9 @@ class LLMEngine:
                 }
                 self.stat_loggers["prometheus"].info("cache_config",
                                                      self.cache_config)
+        
+        # Attach KV-request meter to this engine (v0 path)
+        kv_meter.attach(self)
 
         self.tracer = None
         if self.observability_config.otlp_traces_endpoint:
@@ -692,6 +697,11 @@ class LLMEngine:
             priority=priority,
         )
 
+        # Notify KV-meter about a newly added request.
+        # Use string-typed request_id (validated above).
+        kv_meter.note_request_added(str(request_id))
+
+
     def _create_sequence_group_with_sampling(
         self,
         request_id: str,
@@ -981,6 +991,39 @@ class LLMEngine:
                 and self.process_request_outputs_callback is not None):
             self.process_request_outputs_callback(ctx.request_outputs)
             ctx.request_outputs.clear()
+
+        # --- KV meter update (applies to both async and non-async paths) ---
+        # 1) Per-step KV usage snapshot
+        try:
+            # Active requests in this engine step (scheduled in this iteration)
+            active_req_ids = []
+            if scheduler_outputs is not None:
+                active_req_ids = [
+                    g.seq_group.request_id
+                    for g in scheduler_outputs.scheduled_seq_groups
+                    # skip indices we explicitly marked to skip (preempted)
+                    if not (skip and
+                            scheduler_outputs.scheduled_seq_groups.index(g)
+                            in skip)
+                ]
+            kv_usage_perc, total_blocks = self._get_gpu_kv_usage_and_total_blocks()
+            kv_meter.note_step(
+                active_req_ids=active_req_ids,
+                kv_usage_perc=kv_usage_perc,
+                ts=time.time(),
+                total_blocks=total_blocks,
+            )
+        except Exception:  # meter is best-effort; never break the engine
+            pass
+
+        # 2) Requests that finished in this iteration
+        try:
+            for i in finished_now:
+                sg = scheduler_outputs.scheduled_seq_groups[i]
+                kv_meter.note_request_finished(sg.seq_group.request_id)
+        except Exception:
+            pass
+        # --------------------------------------------------------------------
 
         # For async case, we need to record the stats here.
         # For non-async case, the stats are done in the
@@ -1646,6 +1689,15 @@ class LLMEngine:
             if seq_group.is_finished():
                 self.create_trace_span(seq_group)
 
+    def _get_gpu_kv_usage_and_total_blocks(self) -> tuple[float, int]:
+        """Returns (gpu_kv_usage_ratio, total_gpu_blocks)."""
+        total = int(self.cache_config.num_gpu_blocks or 0)
+        if total <= 0:
+            return 0.0, 0
+        free = sum(s.block_manager.get_num_free_gpu_blocks()
+                   for s in self.scheduler)
+        return (1.0 - (free / total)), total
+
     def create_trace_span(self, seq_group: SequenceGroup) -> None:
         if self.tracer is None or seq_group.sampling_params is None:
             return
@@ -1823,6 +1875,15 @@ class LLMEngine:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
+
+    # ---- KV meter helpers (run-scoped) ----
+    def reset_kv_meter(self, run_id: Optional[str] = None) -> None:
+        """Call this at the beginning of a benchmark run."""
+        kv_meter.reset(run_id)
+
+    def get_kv_meter_summary(self) -> dict:
+        """Call this after the benchmark run to collect per-request + summary."""
+        return kv_meter.get_run_summary()
 
 
 if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:

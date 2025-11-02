@@ -17,6 +17,8 @@ from typing import (TYPE_CHECKING, Annotated, Any, Callable, Dict, List,
 import huggingface_hub
 import regex as re
 import torch
+import json
+from pathlib import Path
 from pydantic import TypeAdapter, ValidationError
 from typing_extensions import TypeIs, deprecated
 
@@ -482,6 +484,12 @@ class EngineArgs:
     
     # Debug Option
     path_debug: bool = False
+
+    # KVTuner-style layer-wise KV quantization config path (plumbing only here).
+    # We accept a filesystem path to a JSON file, load it, and forward the dict
+    # into VllmConfig.additional_config under key "kvtuner_config".
+    # Actual application happens later in the attention/KV write path.
+    kvtuner_config_path: Optional[str] = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -951,6 +959,16 @@ class EngineArgs:
                             action='store_true',
                             help='Disable logging statistics.')
 
+        # ---- KVTuner config path (JSON file on disk) ----
+        # Users pass: --kvtuner-config-path /path/to/kvtuner_config.json
+        vllm_group.add_argument(
+            "--kvtuner-config-path",
+            type=optional_type(str),
+            default=None,
+            help=("Path to a JSON file for KVTuner-style layer-wise KV cache "
+                  "quantization. The file must contain a JSON object (dict). "
+                  "We only load & forward it; application happens in the KV write path."),
+        )
         return parser
 
     @classmethod
@@ -1458,6 +1476,33 @@ class EngineArgs:
             otlp_traces_endpoint=self.otlp_traces_endpoint,
             collect_detailed_traces=self.collect_detailed_traces,
         )
+
+        # If provided, load the KVTuner config JSON from file and embed it into
+        # additional_config so that downstream engine/model/attention code can consume it.
+        if self.kvtuner_config_path is not None:
+            cfg_path = Path(self.kvtuner_config_path).expanduser()
+            if not cfg_path.exists():
+                raise ValueError(
+                    f"KVTuner config file not found: {cfg_path}"
+                )
+            try:
+                with cfg_path.open("r", encoding="utf-8") as f:
+                    kvt_cfg = json.load(f)
+            except Exception as e:
+                # Provide a clear error if the JSON cannot be parsed.
+                raise ValueError(
+                    f"Failed to parse KVTuner JSON at '{cfg_path}': {e}"
+                ) from e
+            if not isinstance(kvt_cfg, dict):
+                # We expect a JSON object; arrays/strings/etc. are invalid here.
+                raise ValueError(
+                    f"KVTuner JSON must be a JSON object (dict): {cfg_path}"
+                )
+            # Merge into additional_config under a stable key.
+            self.additional_config = dict(self.additional_config or {})
+            self.additional_config["kvtuner_config"] = kvt_cfg
+            # (Optional) Keep the path for debugging/observability.
+            self.additional_config["kvtuner_config_path"] = str(cfg_path)
 
         config = VllmConfig(
             model_config=model_config,

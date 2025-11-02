@@ -36,7 +36,8 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm._debug import dprint
 from vllm.v1.metrics.kv_request_meter import kv_meter
-import time
+from vllm.v1.core.kvtuner_quantizer import KVTunerQuantizer, set_global_quantizer
+import os, json, torch
 
 logger = init_logger(__name__)
 
@@ -97,7 +98,7 @@ class LLMEngine:
             # Tokenizer (+ ensure liveness if running in another process).
             self.tokenizer = init_tokenizer_from_configs(
                 model_config=vllm_config.model_config)
-
+        
         # Processor (convert Inputs --> EngineCoreRequests)
         self.processor = Processor(vllm_config=vllm_config,
                                    tokenizer=self.tokenizer,
@@ -111,6 +112,26 @@ class LLMEngine:
                 "vllm.llm_engine",
                 self.observability_config.otlp_traces_endpoint)
             self.output_processor.tracer = tracer
+
+        # ---- KVTuner: Install quantizer BEFORE creating engine_core (so workers see ENV) ----
+        try:
+            add_cfg = getattr(vllm_config, "additional_config", {}) or {}
+            kvt_cfg = add_cfg.get("kvtuner_config", None)
+            if kvt_cfg:
+                # Try to get dtype early; fallback to fp16
+                model_dtype = getattr(getattr(vllm_config, "model_config", None), "dtype", torch.float16)
+                q = KVTunerQuantizer(kvt_cfg, model_dtype)
+                set_global_quantizer(q)
+                os.environ["VLLM_KVTUNER_CONFIG_JSON"] = json.dumps(kvt_cfg)
+                print("[KVTuner] Global quantizer installed (pre-core).")
+            else:
+                set_global_quantizer(None)
+                os.environ.pop("VLLM_KVTUNER_CONFIG_JSON", None)
+                print("[KVTuner] No kvtuner_config; quantizer disabled.")
+        except Exception as e:
+            set_global_quantizer(None)
+            os.environ.pop("VLLM_KVTUNER_CONFIG_JSON", None)
+            print("[KVTuner] Quantizer init failed (pre-core):", str(e))
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
         dprint('path', 'LLMEngine.__init__ creating EngineCore')
@@ -128,7 +149,7 @@ class LLMEngine:
         
         # for kv cache metrics
         kv_meter.attach(self)
-        
+
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 

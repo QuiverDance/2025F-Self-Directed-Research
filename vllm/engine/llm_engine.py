@@ -700,6 +700,7 @@ class LLMEngine:
         # Notify KV-meter about a newly added request.
         # Use string-typed request_id (validated above).
         kv_meter.note_request_added(str(request_id))
+        print(f"[vllm/engine][KV-Meter] Request added: {request_id}")
 
 
     def _create_sequence_group_with_sampling(

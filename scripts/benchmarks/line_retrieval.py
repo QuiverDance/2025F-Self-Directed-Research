@@ -37,6 +37,7 @@ os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 
 from vllm import LLM, SamplingParams
+import gc, time
 
 @dataclass
 class Sample:
@@ -136,111 +137,122 @@ def run(model_path: str,
 
     # Initialize vLLM first so we can use its tokenizer and model max len
     print(f"[vLLM][LineRetrieval] Loading model: {model_path}")
-    t_load0 = time.time()
-    llm = LLM(
-        model=model_path,
-        tokenizer=model_path,
-        dtype="float16",
-        gpu_memory_utilization=0.92,
-        disable_log_stats=False,
-        path_debug=False,
-    )
-    print(f"[vLLM][LineRetrieval] Load done in {time.time() - t_load0:.1f}s")
-
-    tokenizer = llm.get_tokenizer()
-    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
-    assert engine is not None, "Could not access llm_engine/engine from LLM"
-    # Determine token budget
-    model_max = getattr(getattr(engine, "model_config", None), "max_model_len", None)
-    if model_max is None:
-        model_max = 32768  # sensible default if not exposed
-    budget = ctx_budget_tokens if ctx_budget_tokens is not None else max(256, model_max - ctx_margin_tokens)
-
-    # Build samples while enforcing the token budget
-    samples: List[Sample] = []
-    for s in range(num_samples):
-        # Base corpus
-        lines = _make_corpus(
-            num_lines=num_lines,
-            min_words=min_words,
-            max_words=max_words,
-            seed=seed + s * 9973,
-            vocab_mode=vocab_mode,
+    llm = None
+    try:
+        t_load0 = time.time()
+        llm = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            dtype="float16",
+            gpu_memory_utilization=0.92,
+            disable_log_stats=False,
+            path_debug=False,
         )
-        target_idx = _choose_target_index(num_lines, target_mode, rng)
-
-        # Try full size; if too long, shrink lines count proportionally
-        attempt = 0
-        cur_num = num_lines
-        prompt, gold = _build_prompt(lines, target_idx)
-        tok_len = _count_tokens(tokenizer, prompt)
-        while tok_len > budget and attempt < 4 and cur_num > 1:
-            # Estimate new line count
-            shrink_ratio = budget / float(tok_len)
-            new_num = max(1, int(math.floor(cur_num * shrink_ratio * 0.95)))  # keep a small safety margin
-            if new_num == cur_num:
-                new_num = max(1, cur_num - 1)
-            # Rebuild smaller corpus deterministically
-            lines = lines[:new_num]
-            # keep target within range
-            target_idx = min(target_idx, new_num)
+        print(f"[vLLM][LineRetrieval] Load done in {time.time() - t_load0:.1f}s")
+    
+        tokenizer = llm.get_tokenizer()
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        assert engine is not None, "Could not access llm_engine/engine from LLM"
+        # Determine token budget
+        model_max = getattr(getattr(engine, "model_config", None), "max_model_len", None)
+        if model_max is None:
+            model_max = 32768  # sensible default if not exposed
+        budget = ctx_budget_tokens if ctx_budget_tokens is not None else max(256, model_max - ctx_margin_tokens)
+    
+        # Build samples while enforcing the token budget
+        samples: List[Sample] = []
+        for s in range(num_samples):
+            # Base corpus
+            lines = _make_corpus(
+                num_lines=num_lines,
+                min_words=min_words,
+                max_words=max_words,
+                seed=seed + s * 9973,
+                vocab_mode=vocab_mode,
+            )
+            target_idx = _choose_target_index(num_lines, target_mode, rng)
+    
+            # Try full size; if too long, shrink lines count proportionally
+            attempt = 0
+            cur_num = num_lines
             prompt, gold = _build_prompt(lines, target_idx)
             tok_len = _count_tokens(tokenizer, prompt)
-            cur_num = new_num
-            attempt += 1
-
-        samples.append(Sample(prompt=prompt, gold=gold))
-
-    prompts = [s.prompt for s in samples]
-    golds = [s.gold for s in samples]
-
-    sampling = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=0.0,
-        top_p=1.0,
-    )
-
-    # Reset KV meter
-    run_id = f"line_retrieval@{int(time.time())}"
-    if tag:
-        run_id += f"@{tag}"
-    engine.reset_kv_meter(run_id=run_id)
-
-    # Generate
-    started_at = time.time()
-    total_correct = 0
-    for i in range(0, len(prompts), batch_size):
-        outs = llm.generate(prompts[i:i+batch_size], sampling)
-        c, _ = _score_batch(outs, golds[i:i+batch_size])
-        total_correct += c
-    duration_sec = time.time() - started_at
-    acc = total_correct / len(samples)
-
-    kv_summary = engine.get_kv_meter_summary()
-
-    result = {
-        "bench": "line_retrieval",
-        "model": model_path,
-        "num_samples": len(samples),
-        "seed": seed,
-        "config": {
-            "num_lines": num_lines,
-            "min_words": min_words,
-            "max_words": max_words,
-            "vocab_mode": vocab_mode,
-            "target_mode": target_mode,
-            "batch_size": batch_size,
-            "max_new_tokens": max_new_tokens,
-            "ctx_budget_tokens": budget,
-            "ctx_margin_tokens": ctx_margin_tokens,
-        },
-        "started_at": started_at,
-        "duration_sec": duration_sec,
-        "score": acc,
-        "score_display": f"acc={acc*100:.2f}% ({total_correct}/{len(samples)})",
-        "kv_meter_summary": kv_summary,
-        "run_id": run_id,
-    }
-    print(f"[LineRetrieval] {result['score_display']} | N={len(samples)} | time={duration_sec:.2f}s | budget={budget} tok")
-    return result
-
+            while tok_len > budget and attempt < 4 and cur_num > 1:
+                # Estimate new line count
+                shrink_ratio = budget / float(tok_len)
+                new_num = max(1, int(math.floor(cur_num * shrink_ratio * 0.95)))  # keep a small safety margin
+                if new_num == cur_num:
+                    new_num = max(1, cur_num - 1)
+                # Rebuild smaller corpus deterministically
+                lines = lines[:new_num]
+                # keep target within range
+                target_idx = min(target_idx, new_num)
+                prompt, gold = _build_prompt(lines, target_idx)
+                tok_len = _count_tokens(tokenizer, prompt)
+                cur_num = new_num
+                attempt += 1
+    
+            samples.append(Sample(prompt=prompt, gold=gold))
+    
+        prompts = [s.prompt for s in samples]
+        golds = [s.gold for s in samples]
+    
+        sampling = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+            top_p=1.0,
+        )
+    
+        # Reset KV meter
+        run_id = f"line_retrieval@{int(time.time())}"
+        if tag:
+            run_id += f"@{tag}"
+        engine.reset_kv_meter(run_id=run_id)
+    
+        # Generate
+        started_at = time.time()
+        total_correct = 0
+        for i in range(0, len(prompts), batch_size):
+            outs = llm.generate(prompts[i:i+batch_size], sampling)
+            c, _ = _score_batch(outs, golds[i:i+batch_size])
+            total_correct += c
+        duration_sec = time.time() - started_at
+        acc = total_correct / len(samples)
+    
+        kv_summary = engine.get_kv_meter_summary()
+    
+        result = {
+            "bench": "line_retrieval",
+            "model": model_path,
+            "num_samples": len(samples),
+            "seed": seed,
+            "config": {
+                "num_lines": num_lines,
+                "min_words": min_words,
+                "max_words": max_words,
+                "vocab_mode": vocab_mode,
+                "target_mode": target_mode,
+                "batch_size": batch_size,
+                "max_new_tokens": max_new_tokens,
+                "ctx_budget_tokens": budget,
+                "ctx_margin_tokens": ctx_margin_tokens,
+            },
+            "started_at": started_at,
+            "duration_sec": duration_sec,
+            "score": acc,
+            "score_display": f"acc={acc*100:.2f}% ({total_correct}/{len(samples)})",
+            "kv_meter_summary": kv_summary,
+            "run_id": run_id,
+        }
+        print(f"[LineRetrieval] {result['score_display']} | N={len(samples)} | time={duration_sec:.2f}s | budget={budget} tok")
+        return result
+    finally:
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        if engine is not None:
+            try:
+                engine.shutdown()
+            except Exception as e:
+                print(f"[LineRetrieval] llm.shutdown() error: {e}")
+        del llm
+        gc.collect()
+        time.sleep(10)

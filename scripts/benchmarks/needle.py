@@ -29,6 +29,7 @@ os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 
 from vllm import LLM, SamplingParams
+import gc, time
 
 @dataclass
 class Sample:
@@ -132,103 +133,114 @@ def run(model_path: str,
 
     # Init vLLM
     print(f"[vLLM][NIAH] Loading model: {model_path}")
-    t_load0 = time.time()
-    llm = LLM(
-        model=model_path,
-        tokenizer=model_path,
-        dtype="float16",
-        gpu_memory_utilization=0.92,
-        disable_log_stats=False,
-        path_debug=False,
-    )
-    print(f"[vLLM][NIAH] Load done in {time.time() - t_load0:.1f}s")
-
-    tokenizer = llm.get_tokenizer()
-    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
-    assert engine is not None, "Could not access llm_engine/engine from LLM"
-    max_len = getattr(getattr(engine, "model_config", None), "max_model_len", None) or 32768
-    # Total budget for prompt (leave margin + generation)
-    budget = max(256, max_len - ctx_margin_tokens - max_new_tokens)
-
-    # Determine depth fraction
-    if depth_mode != "fraction":
-        if depth_mode == "head":
-            depth_frac = 0.05
-        elif depth_mode == "middle":
-            depth_frac = 0.5
-        elif depth_mode == "tail":
-            depth_frac = 0.95
-        elif depth_mode == "random":
-            depth_frac = rng.random()
+    llm = None
+    try:
+        t_load0 = time.time()
+        llm = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            dtype="float16",
+            gpu_memory_utilization=0.92,
+            disable_log_stats=False,
+            path_debug=False,
+        )
+        print(f"[vLLM][NIAH] Load done in {time.time() - t_load0:.1f}s")
+    
+        tokenizer = llm.get_tokenizer()
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        assert engine is not None, "Could not access llm_engine/engine from LLM"
+        max_len = getattr(getattr(engine, "model_config", None), "max_model_len", None) or 32768
+        # Total budget for prompt (leave margin + generation)
+        budget = max(256, max_len - ctx_margin_tokens - max_new_tokens)
+    
+        # Determine depth fraction
+        if depth_mode != "fraction":
+            if depth_mode == "head":
+                depth_frac = 0.05
+            elif depth_mode == "middle":
+                depth_frac = 0.5
+            elif depth_mode == "tail":
+                depth_frac = 0.95
+            elif depth_mode == "random":
+                depth_frac = rng.random()
+            else:
+                depth_frac = 0.5
         else:
-            depth_frac = 0.5
-    else:
-        depth_frac = float(max(0.0, min(1.0, depth)))
-
-    # Build samples
-    samples: List[Sample] = []
-    for i in range(num_samples):
-        # choose deterministic needle value for reproducibility across seeds
-        rng_i = random.Random(seed + 100003 * i)
-        value = f"N{rng_i.randint(100000, 999999)}"
-        needle_sentence = f"NEEDLE: {value}."
-        # allocate near-target token length but cap by budget
-        target = min(target_tokens, budget - 64)  # keep some room for headers
-        if target <= 64:
-            target = max(64, budget // 2)
-        hay = _make_tokens_to_budget(tokenizer, target, rng_i, vocab_mode=vocab_mode)
-        doc = _insert_needle_by_depth(hay, tokenizer, needle_sentence, depth_frac)
-        prompt = _build_prompt(doc, value)
-        samples.append(Sample(prompt=prompt, gold_value=value))
-
-    prompts = [s.prompt for s in samples]
-    golds = [s.gold_value for s in samples]
-
-    sampling = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=0.0,
-        top_p=1.0,
-        stop=None,
-    )
-
-    # Reset KV meter
-    run_id = f"needle@{int(time.time())}"
-    if tag:
-        run_id += f"@{tag}"
-    engine.reset_kv_meter(run_id=run_id)
-
-    # Generate & score
-    started_at = time.time()
-    total_correct = 0
-    for i in range(0, len(prompts), batch_size):
-        outs = llm.generate(prompts[i:i+batch_size], sampling)
-        c, _ = _score_batch(outs, golds[i:i+batch_size])
-        total_correct += c
-    duration_sec = time.time() - started_at
-    acc = total_correct / len(samples)
-
-    kv_summary = engine.get_kv_meter_summary()
-
-    result = {
-        "bench": "needle",
-        "model": model_path,
-        "num_samples": len(samples),
-        "seed": seed,
-        "config": {
-            "target_tokens": target_tokens,
-            "depth": depth,
-            "depth_mode": depth_mode,
-            "vocab_mode": vocab_mode,
-            "batch_size": batch_size,
-            "max_new_tokens": max_new_tokens,
-        },
-        "started_at": started_at,
-        "duration_sec": duration_sec,
-        "score": acc,
-        "score_display": f"acc={acc*100:.2f}% ({total_correct}/{len(samples)})",
-        "kv_meter_summary": kv_summary,
-        "run_id": run_id,
-    }
-    print(f"[NIAH] {result['score_display']} | N={len(samples)} | time={duration_sec:.2f}s | budget={budget} tok")
-    return result
-
+            depth_frac = float(max(0.0, min(1.0, depth)))
+    
+        # Build samples
+        samples: List[Sample] = []
+        for i in range(num_samples):
+            # choose deterministic needle value for reproducibility across seeds
+            rng_i = random.Random(seed + 100003 * i)
+            value = f"N{rng_i.randint(100000, 999999)}"
+            needle_sentence = f"NEEDLE: {value}."
+            # allocate near-target token length but cap by budget
+            target = min(target_tokens, budget - 64)  # keep some room for headers
+            if target <= 64:
+                target = max(64, budget // 2)
+            hay = _make_tokens_to_budget(tokenizer, target, rng_i, vocab_mode=vocab_mode)
+            doc = _insert_needle_by_depth(hay, tokenizer, needle_sentence, depth_frac)
+            prompt = _build_prompt(doc, value)
+            samples.append(Sample(prompt=prompt, gold_value=value))
+    
+        prompts = [s.prompt for s in samples]
+        golds = [s.gold_value for s in samples]
+    
+        sampling = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            stop=None,
+        )
+    
+        # Reset KV meter
+        run_id = f"needle@{int(time.time())}"
+        if tag:
+            run_id += f"@{tag}"
+        engine.reset_kv_meter(run_id=run_id)
+    
+        # Generate & score
+        started_at = time.time()
+        total_correct = 0
+        for i in range(0, len(prompts), batch_size):
+            outs = llm.generate(prompts[i:i+batch_size], sampling)
+            c, _ = _score_batch(outs, golds[i:i+batch_size])
+            total_correct += c
+        duration_sec = time.time() - started_at
+        acc = total_correct / len(samples)
+    
+        kv_summary = engine.get_kv_meter_summary()
+    
+        result = {
+            "bench": "needle",
+            "model": model_path,
+            "num_samples": len(samples),
+            "seed": seed,
+            "config": {
+                "target_tokens": target_tokens,
+                "depth": depth,
+                "depth_mode": depth_mode,
+                "vocab_mode": vocab_mode,
+                "batch_size": batch_size,
+                "max_new_tokens": max_new_tokens,
+            },
+            "started_at": started_at,
+            "duration_sec": duration_sec,
+            "score": acc,
+            "score_display": f"acc={acc*100:.2f}% ({total_correct}/{len(samples)})",
+            "kv_meter_summary": kv_summary,
+            "run_id": run_id,
+        }
+        print(f"[NIAH] {result['score_display']} | N={len(samples)} | time={duration_sec:.2f}s | budget={budget} tok")
+        return result
+    finally:
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        if engine is not None:
+            try:
+                engine.shutdown()
+            except Exception as e:
+                print(f"[NIAH] llm.shutdown() error: {e}")
+        del llm
+        gc.collect()
+        time.sleep(10)

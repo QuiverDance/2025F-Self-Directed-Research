@@ -19,6 +19,7 @@ os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 
 from vllm import LLM, SamplingParams
+import gc, time
 from datasets import load_dataset
 
 @dataclass
@@ -100,55 +101,66 @@ def run(model_path: str,
     gold_answers = [ex.answer for ex in eval_set]
 
     print(f"[vLLM][GSM8K] Loading model: {model_path}")
-    t_load0 = time.time()
-    llm = LLM(
-        model=model_path,
-        tokenizer=model_path,
-        dtype="float16",
-        gpu_memory_utilization=0.92,
-        disable_log_stats=False,
-        path_debug=False,
-    )
-    print(f"[vLLM][GSM8K] Load done in {time.time() - t_load0:.1f}s")
-
-    sampling = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=0.0,
-        top_p=1.0,
-    )
-
-    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
-    assert engine is not None, "Could not access llm_engine/engine from LLM"
-    run_id = f"gsm8k@{int(time.time())}"
-    if tag:
-        run_id += f"@{tag}"
-    engine.reset_kv_meter(run_id=run_id)
-
-    started_at = time.time()
-    total_correct = 0
-    for i in range(0, len(prompts), batch_size):
-        outs = llm.generate(prompts[i:i+batch_size], sampling)
-        c, _ = _score_batch(outs, gold_answers[i:i+batch_size])
-        total_correct += c
-    duration_sec = time.time() - started_at
-    acc = total_correct / len(eval_set)
-
-    kv_summary = engine.get_kv_meter_summary()
+    llm = None
+    try:
+        t_load0 = time.time()
+        llm = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            gpu_memory_utilization=0.92,
+            disable_log_stats=False,
+            path_debug=False,
+        )
+        print(f"[vLLM][GSM8K] Load done in {time.time() - t_load0:.1f}s")
     
-    result = {
-        "bench": "gsm8k",
-        "model": model_path,
-        "kshot": kshot,
-        "num_samples": len(eval_set),
-        "seed": seed,
-        "max_new_tokens": max_new_tokens,
-        "started_at": started_at,
-        "duration_sec": duration_sec,
-        "score": acc,
-        "score_display": f"acc={acc*100:.2f}%",
-        "kv_meter_summary": kv_summary,
-        "run_id": run_id,
-    }
-    print(f"[GSM8K] {result['score_display']} | N={len(eval_set)} | time={duration_sec:.2f}s")
-    return result
+        sampling = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+            top_p=1.0,
+        )
+    
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        assert engine is not None, "Could not access llm_engine/engine from LLM"
+        run_id = f"gsm8k@{int(time.time())}"
+        if tag:
+            run_id += f"@{tag}"
+        engine.reset_kv_meter(run_id=run_id)
+    
+        started_at = time.time()
+        total_correct = 0
+        for i in range(0, len(prompts), batch_size):
+            outs = llm.generate(prompts[i:i+batch_size], sampling)
+            c, _ = _score_batch(outs, gold_answers[i:i+batch_size])
+            total_correct += c
+        duration_sec = time.time() - started_at
+        acc = total_correct / len(eval_set)
+    
+        kv_summary = engine.get_kv_meter_summary()
+        
+        result = {
+            "bench": "gsm8k",
+            "model": model_path,
+            "kshot": kshot,
+            "num_samples": len(eval_set),
+            "seed": seed,
+            "max_new_tokens": max_new_tokens,
+            "started_at": started_at,
+            "duration_sec": duration_sec,
+            "score": acc,
+            "score_display": f"acc={acc*100:.2f}%",
+            "kv_meter_summary": kv_summary,
+            "run_id": run_id,
+        }
+        print(f"[GSM8K] {result['score_display']} | N={len(eval_set)} | time={duration_sec:.2f}s")
+        return result
+    finally:
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        if engine is not None:
+            try:
+                engine.shutdown()
+            except Exception as e:
+                print(f"[GSM8K] llm.shutdown() error: {e}")
+        del llm
+        gc.collect()
+        time.sleep(10)
 

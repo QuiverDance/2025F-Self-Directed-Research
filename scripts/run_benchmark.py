@@ -7,11 +7,7 @@ run_benchmark.py
 - Prints each bench's wall time and score, and includes KV meter summary.
 """
 
-import os
-import sys
-import json
-import time
-import argparse
+import os, sys, json, time, argparse, gc
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -108,7 +104,8 @@ def run_line_retrieval(model: str, results_dir: Path,
     )
 
 def run_longbench(model: str, results_dir: Path, dataset: str,
-                  num_samples: int, batch_size: int, max_new_tokens: int, seed: int, tag: str):
+                  num_samples: int, batch_size: int, max_new_tokens: int, seed: int, tag: str,
+                  lb_data_dir: str = ""):
     from benchmarks.longbench import run as lb_run
     return lb_run(
         model_path=model,
@@ -118,6 +115,7 @@ def run_longbench(model: str, results_dir: Path, dataset: str,
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
         seed=seed, tag=tag,
+        data_dir=(lb_data_dir or None),
     )
 
 def run_needle(model: str, results_dir: Path,
@@ -214,7 +212,6 @@ def main():
                 num_samples=cfg.get("num_samples", args.num_samples),
                 batch_size=cfg.get("batch_size", args.batch_size),
                 max_new_tokens=cfg.get("max_new_tokens", args.max_new_tokens),
-                lb_data_dir=cfg.get("lb_data_dir", args.lb_data_dir),
                 lr_num_lines=cfg.get("lr_num_lines", args.lr_num_lines),
                 lr_min_words=cfg.get("lr_min_words", args.lr_min_words),
                 lr_max_words=cfg.get("lr_max_words", args.lr_max_words),
@@ -234,6 +231,7 @@ def main():
                 num_samples=cfg.get("num_samples", args.num_samples),
                 batch_size=cfg.get("batch_size", args.batch_size),
                 max_new_tokens=cfg.get("max_new_tokens", args.max_new_tokens),
+                lb_data_dir=cfg.get("lb_data_dir", args.lb_data_dir),
                 seed=cfg.get("seed", args.seed),
                 tag=cfg.get("tag", args.tag),
             )
@@ -272,6 +270,10 @@ def main():
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         print(f"[{bench}] results written to: {out_path}")
+        
+        gc.collect()
+        time.sleep(30.0)
+
         return bench, {"score": result.get("score"), "score_display": result.get("score_display"),
                        "duration_sec": dt, "result_path": str(out_path)}
 

@@ -28,6 +28,7 @@ os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 
 from vllm import LLM, SamplingParams
+import gc, time
 from datasets import load_dataset
 
 @dataclass
@@ -100,71 +101,83 @@ def run(model_path: str,
     eval_set = tasks[:num_samples]
 
     prompts = [t.prompt for t in eval_set]
-
+    
     print(f"[vLLM][HumanEval] Loading model: {model_path}")
-    t_load0 = time.time()
-    llm = LLM(
-        model=model_path,
-        tokenizer=model_path,
-        dtype="float16",
-        gpu_memory_utilization=0.92,
-        disable_log_stats=False,
-        path_debug=False,
-    )
-    print(f"[vLLM][HumanEval] Load done in {time.time() - t_load0:.1f}s")
-
-    sampling = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=0.0,
-        top_p=1.0,
-        stop=None,
-    )
-
-    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
-    assert engine is not None, "Could not access llm_engine/engine from LLM"
-    run_id = f"humaneval@{int(time.time())}"
-    if tag:
-        run_id += f"@{tag}"
-    engine.reset_kv_meter(run_id=run_id)
-
-    started_at = time.time()
-    per_task = []
-    passed_cnt = 0
-
-    for i in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[i:i+batch_size]
-        outs = llm.generate(batch_prompts, sampling)
-        for j, out in enumerate(outs):
-            t = eval_set[i + j]
-            if not out.outputs:
-                per_task.append({"task_id": t.task_id, "pass": False, "err": "NO_OUTPUT"})
-                continue
-            completion = out.outputs[0].text or ""
-            program = _build_program(t.prompt, completion, t.test)
-            ok, err_tail = _run_test_in_subprocess(program_text=program, timeout_s=10)
-            per_task.append({"task_id": t.task_id, "pass": ok, "err": err_tail})
-            if ok:
-                passed_cnt += 1
-
-    duration_sec = time.time() - started_at
-    pass_at_1 = passed_cnt / len(eval_set)
-
-    kv_summary = engine.get_kv_meter_summary()
-
-    result = {
-        "bench": "humaneval",
-        "model": model_path,
-        "num_samples": len(eval_set),
-        "seed": seed,
-        "max_new_tokens": max_new_tokens,
-        "started_at": started_at,
-        "duration_sec": duration_sec,
-        "score": pass_at_1,
-        "score_display": f"pass@1={pass_at_1*100:.2f}% ({passed_cnt}/{len(eval_set)})",
-        "kv_meter_summary": kv_summary,
-        "run_id": run_id,
-        "per_task": per_task,
-    }
-    print(f"[HumanEval] {result['score_display']} | N={len(eval_set)} | time={duration_sec:.2f}s")
-    return result
+    llm = None
+    try:
+        t_load0 = time.time()
+        llm = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            dtype="float16",
+            gpu_memory_utilization=0.92,
+            disable_log_stats=False,
+            path_debug=False,
+        )
+        print(f"[vLLM][HumanEval] Load done in {time.time() - t_load0:.1f}s")
+    
+        sampling = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            stop=None,
+        )
+    
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        assert engine is not None, "Could not access llm_engine/engine from LLM"
+        run_id = f"humaneval@{int(time.time())}"
+        if tag:
+            run_id += f"@{tag}"
+        engine.reset_kv_meter(run_id=run_id)
+    
+        started_at = time.time()
+        per_task = []
+        passed_cnt = 0
+    
+        for i in range(0, len(prompts), batch_size):
+            batch_prompts = prompts[i:i+batch_size]
+            outs = llm.generate(batch_prompts, sampling)
+            for j, out in enumerate(outs):
+                t = eval_set[i + j]
+                if not out.outputs:
+                    per_task.append({"task_id": t.task_id, "pass": False, "err": "NO_OUTPUT"})
+                    continue
+                completion = out.outputs[0].text or ""
+                program = _build_program(t.prompt, completion, t.test)
+                ok, err_tail = _run_test_in_subprocess(program_text=program, timeout_s=10)
+                per_task.append({"task_id": t.task_id, "pass": ok, "err": err_tail})
+                if ok:
+                    passed_cnt += 1
+    
+        duration_sec = time.time() - started_at
+        pass_at_1 = passed_cnt / len(eval_set)
+    
+        kv_summary = engine.get_kv_meter_summary()
+    
+        result = {
+            "bench": "humaneval",
+            "model": model_path,
+            "num_samples": len(eval_set),
+            "seed": seed,
+            "max_new_tokens": max_new_tokens,
+            "started_at": started_at,
+            "duration_sec": duration_sec,
+            "score": pass_at_1,
+            "score_display": f"pass@1={pass_at_1*100:.2f}% ({passed_cnt}/{len(eval_set)})",
+            "kv_meter_summary": kv_summary,
+            "run_id": run_id,
+            "per_task": per_task,
+        }
+        print(f"[HumanEval] {result['score_display']} | N={len(eval_set)} | time={duration_sec:.2f}s")
+        return result
+    finally:
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        if engine is not None:
+            try:
+                engine.shutdown()
+            except Exception as e:
+                print(f"[HumanEval] llm.shutdown() error: {e}")
+        del llm
+        gc.collect()
+        time.sleep(10)
 

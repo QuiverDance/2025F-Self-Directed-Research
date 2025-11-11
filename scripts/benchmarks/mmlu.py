@@ -23,6 +23,7 @@ os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")    # suppress noisy INFO lo
 os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")    # disable vLLM default logging setup
 
 from vllm import LLM, SamplingParams
+import gc, time
 from datasets import load_dataset
 
 # 57 MMLU subjects
@@ -313,78 +314,89 @@ def run(model_path: str,
 
     # Initialize vLLM
     print(f"[vLLM][MMLU] Loading model: {model_path}")
-    t_load0 = time.time()
-    llm = LLM(
-        model=model_path,
-        tokenizer=model_path,
-        dtype="float16",
-        gpu_memory_utilization=0.92,
-        disable_log_stats=False,
-        path_debug=False,
-    )
-    print(f"[vLLM][MMLU] Load done in {time.time() - t_load0:.1f}s")
-
-    # Sampling params: single token, deterministic
-    sampling = SamplingParams(
-        max_tokens=2,
-        temperature=0.0,
-        top_p=1.0,
-        logprobs=5,
-        stop=["\n"],
-    )
-
-    # Reset KV meter for this run
-    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
-    assert engine is not None, "Could not access llm_engine/engine from LLM"
-    run_id = f"mmlu@{int(time.time())}"
-    if tag:
-        run_id += f"@{tag}"
-    engine.reset_kv_meter(run_id=run_id)
-
-    # Generate in batches
-    started_at = time.time()
-    total_correct = 0
-    preds_all: List[str] = []
-    for i in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[i:i+batch_size]
-        batch_gold = gold_letters[i:i+batch_size]
-        outs = llm.generate(batch_prompts, sampling)
-        n_correct, preds = _score_batch_text(outs, batch_gold)
-        total_correct += n_correct
-        preds_all.extend(preds)
-
-    duration_sec = time.time() - started_at
-    micro_acc = total_correct / len(eval_set)
-
-    # Macro (subject-averaged) accuracy
-    subj_scores = {}
-    for subj, exs in by_subject.items():
-        idxs = [j for j, e in enumerate(eval_set) if e.subject == subj]
-        if not idxs:
-            continue
-        c = sum(1 for j in idxs if preds_all[j] == gold_letters[j])
-        subj_scores[subj] = {"n": len(idxs), "acc": (c / len(idxs)) if len(idxs) else 0.0}
-    macro_acc = (sum(v["acc"] for v in subj_scores.values()) / len(subj_scores)) if subj_scores else 0.0
-
-    # KV summary
-    kv_summary = engine.get_kv_meter_summary()
+    llm = None
+    try:
+        t_load0 = time.time()
+        llm = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            dtype="float16",
+            gpu_memory_utilization=0.92,
+            disable_log_stats=False,
+            path_debug=False,
+        )
+        print(f"[vLLM][MMLU] Load done in {time.time() - t_load0:.1f}s")
     
-    # Assemble result
-    result = {
-        "bench": "mmlu",
-        "model": model_path,
-        "kshot": kshot,
-        "num_samples": len(eval_set),
-        "seed": seed,
-        "started_at": started_at,
-        "duration_sec": duration_sec,
-        "score": macro_acc,
-        "score_display": f"macro={macro_acc*100:.2f}%, micro={micro_acc*100:.2f}%",
-        "micro_acc": micro_acc,
-        "per_subject": subj_scores,
-        "kv_meter_summary": kv_summary,
-        "run_id": run_id,
-    }
-    print(f"[MMLU] {result['score_display']} | N={len(eval_set)} | time={duration_sec:.2f}s")
-    return result
-
+        # Sampling params: single token, deterministic
+        sampling = SamplingParams(
+            max_tokens=2,
+            temperature=0.0,
+            top_p=1.0,
+            logprobs=5,
+            stop=["\n"],
+        )
+    
+        # Reset KV meter for this run
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        assert engine is not None, "Could not access llm_engine/engine from LLM"
+        run_id = f"mmlu@{int(time.time())}"
+        if tag:
+            run_id += f"@{tag}"
+        engine.reset_kv_meter(run_id=run_id)
+    
+        # Generate in batches
+        started_at = time.time()
+        total_correct = 0
+        preds_all: List[str] = []
+        for i in range(0, len(prompts), batch_size):
+            batch_prompts = prompts[i:i+batch_size]
+            batch_gold = gold_letters[i:i+batch_size]
+            outs = llm.generate(batch_prompts, sampling)
+            n_correct, preds = _score_batch_text(outs, batch_gold)
+            total_correct += n_correct
+            preds_all.extend(preds)
+    
+        duration_sec = time.time() - started_at
+        micro_acc = total_correct / len(eval_set)
+    
+        # Macro (subject-averaged) accuracy
+        subj_scores = {}
+        for subj, exs in by_subject.items():
+            idxs = [j for j, e in enumerate(eval_set) if e.subject == subj]
+            if not idxs:
+                continue
+            c = sum(1 for j in idxs if preds_all[j] == gold_letters[j])
+            subj_scores[subj] = {"n": len(idxs), "acc": (c / len(idxs)) if len(idxs) else 0.0}
+        macro_acc = (sum(v["acc"] for v in subj_scores.values()) / len(subj_scores)) if subj_scores else 0.0
+    
+        # KV summary
+        kv_summary = engine.get_kv_meter_summary()
+        
+        # Assemble result
+        result = {
+            "bench": "mmlu",
+            "model": model_path,
+            "kshot": kshot,
+            "num_samples": len(eval_set),
+            "seed": seed,
+            "started_at": started_at,
+            "duration_sec": duration_sec,
+            "score": macro_acc,
+            "score_display": f"macro={macro_acc*100:.2f}%, micro={micro_acc*100:.2f}%",
+            "micro_acc": micro_acc,
+            "per_subject": subj_scores,
+            "kv_meter_summary": kv_summary,
+            "run_id": run_id,
+        }
+        print(f"[MMLU] {result['score_display']} | N={len(eval_set)} | time={duration_sec:.2f}s")
+        return result
+    finally:
+        engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+        if engine is not None:
+            try:
+                engine.shutdown()
+            except Exception as e:
+                print(f"[MMLU] llm.shutdown() error: {e}")
+        del llm
+        gc.collect()
+        time.sleep(10)

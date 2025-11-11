@@ -105,6 +105,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm.v1.core.kvtuner_quantizer import KVTunerQuantizer
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+
 logger = init_logger(__name__)
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -166,7 +169,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-    ):
+        quantizer: Optional[KVTunerQuantizer] = None,
+    ):  
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -423,6 +427,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
+
+        # === KVTuner ===
+        self._kvt_quantizer: Optional["KVTunerQuantizer"] = quantizer
+        # Always-on debug
+        print(f"[KVTuner][GPUModelRunner] quantizer_rcvd={self._kvt_quantizer is not None} "
+              f"qid={id(self._kvt_quantizer)} device={self.device}", flush=True)
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -3355,7 +3365,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # attention backend subclasses (e.g. ChunkedLocalAttention) unless
             # they are cached correctly, there will be different objects per
             # layer.
-            for layer_name in layer_names:
+            for idx, layer_name in enumerate(layer_names):
+                # ---- Inject into *Impl* (has forward) ----
+                impl = getattr(layers[layer_name], "impl", None)
+                if impl is not None:
+                    if self._kvt_quantizer is not None:
+                        setattr(impl, "kvtuner_quantizer", self._kvt_quantizer)
+                        setattr(impl, "kvtuner_layer_idx", int(idx))  # stable per-layer index
+
+                        # KVTUNER_DEBUG_START
+                        import os, sys
+                        print(f"[KVTuner:inject] pid={os.getpid()} layer={idx} impl={type(impl).__name__} qtz=Y",
+                              flush=True, file=sys.stderr)
+                        # KVTUNER_DEBUG_END
+
                 attn_backend = layers[layer_name].get_attn_backend()
 
                 if layer_name in self.kv_sharing_fast_prefill_eligible_layers:

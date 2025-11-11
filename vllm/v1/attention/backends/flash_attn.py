@@ -5,8 +5,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import torch
-
+import torch, os, sys
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
@@ -30,6 +29,8 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               CommonAttentionMetadata,
                                               get_kv_cache_layout)
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from vllm.v1.core.kv_cache_coordinator import get_global_coordinator
 
 logger = init_logger(__name__)
 
@@ -379,6 +380,13 @@ class FlashAttentionImpl(AttentionImpl):
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
         sinks: Optional[torch.Tensor] = None,
+        # --- START: DEBUGGING CODE ---
+        # Add layer_idx as an argument to easily track which layer is being processed.
+        # This requires a small change where this class is instantiated.
+        # For now, we will assume it's passed or set externally for logging.
+        # To make it work, we add it to the init signature.
+        layer_idx: int = -1,
+        # --- END: DEBUGGING CODE ---
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -399,6 +407,11 @@ class FlashAttentionImpl(AttentionImpl):
             logits_soft_cap = 0
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+
+        # --- START: DEBUGGING CODE ---
+        # Store the layer_idx for use in the forward pass logging.
+        self.kvtuner_layer_idx = layer_idx
+        # --- END: DEBUGGING CODE ---
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
@@ -447,7 +460,7 @@ class FlashAttentionImpl(AttentionImpl):
               We use torch's .expand() to avoid duplicating values
         """
         assert output is not None, "Output tensor must be provided."
-
+        
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
@@ -480,21 +493,202 @@ class FlashAttentionImpl(AttentionImpl):
                                                    output[:num_actual_tokens],
                                                    attn_metadata, layer)
 
-        # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(0)
+        # --- Debug helper: compact tensor stats (always-on; remove after diagnosis) ---
+        def _dbg_stats(name: str, t: torch.Tensor):
+            try:
+                dev = str(t.device)
+                dtype = str(t.dtype)
+                shape = tuple(t.shape)
+                tf = t.float()
+                finite = torch.isfinite(tf)
+                fin_ratio = float(finite.sum().item()) / float(tf.numel() or 1)
+                tmin = tf[finite].min().item() if finite.any() else float('nan')
+                tmax = tf[finite].max().item() if finite.any() else float('nan')
+                tmean = tf[finite].mean().item() if finite.any() else float('nan')
+                l2 = torch.linalg.vector_norm(tf[finite]).item() if finite.any() else float('nan')
+                print(f"[KVTuner:DBG] {name} dev={dev} dtype={dtype} shape={shape} "
+                      f"finite={fin_ratio:.3f} min={tmin:.5f} max={tmax:.5f} mean={tmean:.5f} l2={l2:.5f}")
+            except Exception as _e:
+                import sys
+                print(f"[KVTuner:DBG][ERR] stats({name}): {type(_e).__name__}: {_e}", file=sys.stderr)
+        
+        # Derive block size directly from kv_cache: [2, B, block_size, H, D]
+        block_size = int(kv_cache.size(2))
 
-        # key and value may be None in the case of cross attention. They are
-        # calculated once based on the output from the encoder and then cached
-        # in KV cache.
+        # For decoder/cross-attention, use KV cache as usual
+        key_cache, value_cache = kv_cache.unbind(0)
+        
+        # if key_cache is not None:
+        #     print(f"[KVTuner:ATTN] K shape={key_cache.shape} range=[{key_cache.min():.4f}, {key_cache.max():.4f}]")
+        # if value_cache is not None:
+        #     print(f"[KVTuner:ATTN] V shape={value_cache.shape} range=[{value_cache.min():.4f}, {value_cache.max():.4f}]")
+            
+        # KVTuner integration (global coordinator owns quantizer and pool)
+        coord = get_global_coordinator()
+        kv_quantizer = getattr(coord, "kv_quantizer", None)
+
+        # Maintain per-kind per-block row maps to place rows at correct offsets
+        # Structure: {"k": {bid: LongTensor(sorted unique offsets)}, "v": {...}}
+        if not hasattr(self, "_kvt_rowmap"):
+            self._kvt_rowmap = {"k": {}, "v": {}}
+
+        # --- KVTuner read-before-attention (Decode path): restore K/V from tails ---
+        # Plan compliance:
+        #   Decode: Read -> Decompress -> Attention -> Compress -> Store
+        #   Prefill: (no read)
+        try:
+            # MODIFICATION: Allow this block to run during decode
+            # to implement the "Read" part of the Read-Modify-Write cycle.
+            # It restores the previous full-precision state into the working cache.
+            # This function is being documented in English.
+            if (kv_quantizer is not None
+                and getattr(kv_quantizer, "enable", False)):
+                # Collect unique physical block ids referenced by current batch.
+
+                # --- START: DEBUGGING CODE ---
+                # This log will now appear for every layer during prefill,
+                # confirming that the dequantization block is being executed correctly.
+                layer_idx = getattr(self, "kvtuner_layer_idx", -1)
+                # print(f"[KVTuner:DEQUANT-TRACE] Executing for Layer {layer_idx}, "
+                #       f"num_actual_tokens={num_actual_tokens} (Prefill > 1, Decode == 1)")
+                # --- END: DEBUGGING CODE ---
+
+                bt = attn_metadata.block_table  # [num_seqs, max_blocks] with -1 as padding
+                if isinstance(bt, torch.Tensor):
+                    used = bt[bt > 0]
+                    if used.numel() > 0:
+                        uniq = torch.unique(used).tolist()
+                        # Dequantize per block and copy rows into cache tensors.
+                        from vllm.v1.core.kvtuner_quantizer import PackedKV
+                        for _bid in uniq:
+                            bid = int(_bid)
+                            k_tail = coord.block_pool.read_k_tail(bid)
+                            v_tail = coord.block_pool.read_v_tail(bid)
+                            if k_tail is None or v_tail is None:
+                                continue  # nothing stored for this block
+                            pk, mk, scale_k, zp_k = k_tail
+                            pv, mv, scale_v, zp_v = v_tail
+                            
+                            # Meta tensors -> raw bytes for the quantizer
+                            mk_bytes = mk.detach().cpu().contiguous().numpy().tobytes()
+                            mv_bytes = mv.detach().cpu().contiguous().numpy().tobytes()
+
+                            # Dequantize to cache dtype/device; shapes: [rows, H, D]
+                            from vllm.v1.core.kvtuner_quantizer import PackedKV as _Packed
+                            dec_k = kv_quantizer.dequantize_k(_Packed(packed=pk, meta_bytes=mk_bytes))\
+                                                   .to(dtype=key_cache.dtype, device=key_cache.device)
+                            dec_v = kv_quantizer.dequantize_v(_Packed(packed=pv, meta_bytes=mv_bytes))\
+                                                   .to(dtype=value_cache.dtype, device=value_cache.device)
+
+                            # Place rows at the correct offsets with proper layout
+                            dk_rows = int(dec_k.shape[0])
+                            dv_rows = int(dec_v.shape[0])
+                            
+                            # --- START: FIX ---
+                            #
+                            # ISSUE: The original code had redundant `.reshape()` calls and used `.copy_()`,
+                            # which can cause data corruption if tensor memory layouts (strides) mismatch.
+                            #
+                            # FIX:
+                            # 1. Removed the unnecessary `.reshape()` calls. The `dequantize` function
+                            #    already returns tensors with the correct shape.
+                            # 2. Replaced the fragile `.copy_()` operation with direct slice assignment,
+                            #    which is more robust for writing data into tensor views.
+                            # 3. Added debug prints to verify that the data written to the cache
+                            #    matches the dequantized data immediately before assignment.
+
+                            # The dequantized tensors are already in the correct shape.
+                            # Ensure they are contiguous before assignment.
+                            dec_k = dec_k.contiguous()
+                            dec_v = dec_v.contiguous()
+
+                            # --- START: DEBUGGING CODE ---
+                            # This code verifies that the dequantized values are correct right before
+                            # they are placed back into the main KV cache.
+                            try:
+                                k_min, k_max, k_mean = dec_k.min().item(), dec_k.max().item(), dec_k.mean().item()
+                                v_min, v_max, v_mean = dec_v.min().item(), dec_v.max().item(), dec_v.mean().item()
+                                # print(f"[KVTuner:VERIFY][PRE-WRITE] bid={bid} "
+                                #       f"K(shape={dec_k.shape}, range=[{k_min:.4f}, {k_max:.4f}], mean={k_mean:.4f}) "
+                                #       f"V(shape={dec_v.shape}, range=[{v_min:.4f}, {v_max:.4f}], mean={v_mean:.4f})")
+                            except Exception as e:
+                                print(f"[KVTuner:VERIFY][ERROR] Pre-write stat failed: {e}")
+                            # --- END: DEBUGGING CODE ---
+                            
+                            # Perform direct assignment to the cache slices. This is safer than copy_().
+                            key_cache[bid, :dk_rows] = dec_k
+                            value_cache[bid, :dv_rows] = dec_v
+                            
+                            # --- START: DEBUGGING CODE ---
+                            # This code verifies that the values in the KV cache match the source
+                            # tensor immediately after the write operation.
+                            try:
+                                written_k = key_cache[bid, :dk_rows]
+                                written_v = value_cache[bid, :dv_rows]
+                                k_min, k_max, k_mean = written_k.min().item(), written_k.max().item(), written_k.mean().item()
+                                v_min, v_max, v_mean = written_v.min().item(), written_v.max().item(), written_v.mean().item()
+                                # print(f"[KVTuner:VERIFY][POST-WRITE] bid={bid} "
+                                #       f"K(shape={written_k.shape}, range=[{k_min:.4f}, {k_max:.4f}], mean={k_mean:.4f}) "
+                                #       f"V(shape={written_v.shape}, range=[{v_min:.4f}, {v_max:.4f}], mean={v_mean:.4f})")
+                                # Assert that the data is identical.
+                                assert torch.all(written_k == dec_k)
+                                assert torch.all(written_v == dec_v)
+                            except Exception as e:
+                                print(f"[KVTuner:VERIFY][ERROR] Post-write verification failed: {e}")
+                            # --- END: DEBUGGING CODE ---
+                            #
+                            # --- END: FIX ---
+
+                            # Preserve tensor layout when reshaping to match cache format
+                            # Shape should be [num_rows, num_heads, head_dim] with proper strides
+                            # dec_k = dec_k.reshape(dk_rows, key_cache.size(2), key_cache.size(3))
+                            # dec_v = dec_v.reshape(dv_rows, value_cache.size(2), value_cache.size(3))
+
+                            # # Convert to target dtype/device and ensure contiguous memory
+                            # dec_k = dec_k.to(dtype=key_cache.dtype, device=key_cache.device, memory_format=torch.contiguous_format)
+                            # dec_v = dec_v.to(dtype=value_cache.dtype, device=value_cache.device, memory_format=torch.contiguous_format)
+                            
+                            # # Copy blocks with explicit indices
+                            # try:
+                            #     target_k = key_cache[bid, :dk_rows]
+                            #     target_v = value_cache[bid, :dv_rows]
+                                
+                            #     # Ensure shapes match before copying
+                            #     assert target_k.shape == dec_k.shape, f"Shape mismatch K: {target_k.shape} vs {dec_k.shape}"
+                            #     assert target_v.shape == dec_v.shape, f"Shape mismatch V: {target_v.shape} vs {dec_v.shape}"
+                                
+                            #     # Perform direct copy
+                            #     target_k.copy_(dec_k)
+                            #     target_v.copy_(dec_v)
+                                
+                            #     # print(f"[KVTuner:DBG] After copy K[0,0,:8]={target_k[0,0,:8].tolist()}")
+                            # except Exception as e:
+                            #     print(f"[KVTuner:DBG][ERROR] Copy failed: {str(e)}")
+                            #     # Fallback to direct assignment if copy fails
+                            #     key_cache[bid, :dk_rows] = dec_k
+                            #     value_cache[bid, :dv_rows] = dec_v
+                            # # Extra per-block debug for KVTuner investigation
+                            try:
+                                dkf = dec_k.float()
+                                dvf = dec_v.float()
+                                # print(f"[KVTuner:DBG] placed block bid={bid} dk_rows={dk_rows} dv_rows={dv_rows} "
+                                #       f"K_block_range=[{dkf.min():.5f},{dkf.max():.5f}] V_block_range=[{dvf.min():.5f},{dvf.max():.5f}]")
+                            except Exception:
+                                pass
+
+        except Exception as _e:
+            import sys
+            print(f"[KVTuner:read-before-attn][WARN] {type(_e).__name__}: {_e}", file=sys.stderr)
+        # --- END KVTuner read-before-attention ---
+
+        # key and value may be None in cross attention. They are calculated once
+        # from the encoder output and then cached. If they exist, reshape & cache.
         if (self.kv_sharing_target_layer_name is None and key is not None
                 and value is not None):
-            # Reshape the input keys and values and store them in the cache.
-            # Skip this if sharing KV cache with an earlier attention layer.
-            # NOTE(woosuk): Here, key and value are padded while slot_mapping is
-            # not padded. However, we don't need to do key[:num_actual_tokens]
-            # and value[:num_actual_tokens] because the reshape_and_cache_flash
-            # op uses the slot_mapping's shape to determine the number of
-            # actual tokens.
+
+            # Reshape input K/V and store them in the cache (raw layout).
+            # NOTE: The reshape_and_cache op uses slot_mapping's shape to decide
+            # the number of actual tokens; K/V tensors here may be padded.
             reshape_and_cache_flash(
                 key,
                 value,
@@ -505,7 +699,7 @@ class FlashAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
-
+        
         if self.kv_cache_dtype.startswith("fp8"):
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype)
@@ -524,9 +718,89 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_q = attn_metadata.max_query_len
             max_seqlen_k = attn_metadata.max_seq_len
             block_table = attn_metadata.block_table
+
+            # --- START: DIAGNOSTIC DEBUGGING CODE ---
+            #
+            # GOAL: Inspect the state of query, key_cache, and value_cache right before
+            # they are passed to the attention kernel. This will reveal if the
+            # inputs are corrupted (e.g., all zeros, NaN, Inf).
+
+            try:
+                num_active_tokens = query.shape[0]
+                layer_idx = getattr(self, "kvtuner_layer_idx", -1)
+                
+                # 1. Query Statistics
+                q_l2 = torch.linalg.norm(query.float()).item()
+                q_mean = query.float().mean().item()
+                # print(f"[KVTuner:KERNEL-INPUT L{layer_idx}] "
+                #       f"Query ({query.shape}): L2={q_l2:.4f}, Mean={q_mean:.4f}")
+
+                # 2. Active KV Cache Statistics
+                # We only inspect the blocks that are actually used by the current batch.
+                active_blocks_flat = block_table[:attn_metadata.query_start_loc.shape[0]-1].flatten()
+                unique_block_indices = torch.unique(active_blocks_flat[active_blocks_flat >= 0])
+                
+                if unique_block_indices.numel() > 0:
+                    active_k_cache = key_cache[unique_block_indices]
+                    active_v_cache = value_cache[unique_block_indices]
+                    
+                    k_l2 = torch.linalg.norm(active_k_cache.float()).item()
+                    k_mean = active_k_cache.float().mean().item()
+                    k_min, k_max = active_k_cache.min().item(), active_k_cache.max().item()
+
+                    v_l2 = torch.linalg.norm(active_v_cache.float()).item()
+                    v_mean = active_v_cache.float().mean().item()
+                    v_min, v_max = active_v_cache.min().item(), active_v_cache.max().item()
+
+                    # print(f"[KVTuner:KERNEL-INPUT L{layer_idx}] "
+                    #       f"Active K-Cache ({active_k_cache.shape}): L2={k_l2:.4f}, Mean={k_mean:.4f}, Range=[{k_min:.4f}, {k_max:.4f}]")
+                    # print(f"[KVTuner:KERNEL-INPUT L{layer_idx}] "
+                    #       f"Active V-Cache ({active_v_cache.shape}): L2={v_l2:.4f}, Mean={v_mean:.4f}, Range=[{v_min:.4f}, {v_max:.4f}]")
+                else:
+                    print(f"[KVTuner:KERNEL-INPUT L{layer_idx}] No active KV cache blocks for this batch.")
+
+            except Exception as e:
+                print(f"[KVTuner:KERNEL-INPUT L{layer_idx}][ERROR] Failed to print debug stats: {e}", file=sys.stderr)
+            
+            # --- END: DIAGNOSTIC DEBUGGING CODE ---
+
             scheduler_metadata = attn_metadata.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+
+            # NORMALIZE block_table padding for Flash-Attention 
+            # Our system uses 0 for padding, but Flash-Attention expects -1
+            # Clone first to avoid modifying the original
+            block_table_for_fa = block_table.clone()
+
+            # Convert padding 0s to -1s with in-place update
+            # Look for zeros in block table and mark them as padding (-1)
+            padding_mask = (block_table_for_fa == 0)
+            block_table_for_fa[padding_mask] = -1
+
+            # --- START: DEBUGGING CODE ---
+            # This verification ensures the block table is correctly formatted before the kernel call.
+            try:
+                # 1. Assert that no 0s are left, as 0 is a valid physical block index (null_block)
+                #    but should not be present after padding conversion.
+                assert not (block_table_for_fa == 0).any(), \
+                    "Block table still contains 0s after padding conversion."
+
+                # 2. Check that all indices are either -1 (padding) or valid block indices.
+                num_physical_blocks = key_cache.size(0)
+                min_idx = block_table_for_fa.min().item()
+                max_idx = block_table_for_fa.max().item()
+
+                assert min_idx >= -1, f"Invalid block index {min_idx} found. Must be >= -1."
+                assert max_idx < num_physical_blocks, \
+                    f"Invalid block index {max_idx} found. Must be < {num_physical_blocks}."
+
+                # print(f"[KVTuner:VALIDATE-BT] Block table for FlashAttention is valid. "
+                #       f"Index range: [{min_idx}, {max_idx}], "
+                #       f"Padding ratio: {(block_table_for_fa == -1).float().mean().item():.2%}")
+            except AssertionError as e:
+                print(f"[KVTuner:VALIDATE-BT][ERROR] {e}", file=sys.stderr)
+            # --- END: DEBUGGING CODE ---
 
             flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
@@ -541,16 +815,103 @@ class FlashAttentionImpl(AttentionImpl):
                 causal=attn_metadata.causal,
                 alibi_slopes=self.alibi_slopes,
                 window_size=self.sliding_window,
-                block_table=block_table,
+                block_table=block_table_for_fa,
                 softcap=self.logits_soft_cap,
                 scheduler_metadata=scheduler_metadata,
                 fa_version=self.vllm_flash_attn_version,
-                q_descale=layer._q_scale.expand(descale_shape),
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
+                # q_descale=layer._q_scale.expand(descale_shape),
+                # k_descale=layer._k_scale.expand(descale_shape),
+                # v_descale=layer._v_scale.expand(descale_shape),
+                q_descale=None,      # Now correctly passed as None for non-FP8
+                k_descale=None,      # Now correctly passed as None for non-FP8
+                v_descale=None,      # Now correctly passed as None for non-FP8
                 num_splits=attn_metadata.max_num_splits,
                 s_aux=self.sinks,
             )
+
+            # --- KVTuner write-after-attention: Attn -> Compress -> Store ---
+            try:
+                # MODIFICATION: Allow this block to run during decode to implement the "Modify-Write" part.
+                # It takes the updated full-precision cache, re-quantizes the ENTIRE block history,
+                # and overwrites the storage snapshot.
+                # This function is being documented in English.
+                if (kv_quantizer is not None
+                    and getattr(kv_quantizer, "enable", False)
+                    and attn_type == AttentionType.DECODER
+                    and key is not None and value is not None):
+                    # Group current-step tokens by block id, then quantize & store per block tail.
+                    num_actual_tokens = int(attn_metadata.num_actual_tokens)
+                    if num_actual_tokens > 0:
+                        slots = attn_metadata.slot_mapping[:num_actual_tokens]
+                        block_size = int(kv_cache.size(2))
+                        mask = (slots >= 0)
+                        if torch.count_nonzero(mask) > 0:
+                            local_slots = slots[mask]
+                            local_idx = torch.nonzero(mask, as_tuple=False).view(-1)
+                            block_ids = torch.div(local_slots, block_size, rounding_mode='floor')
+                            offs_in_block = (local_slots % block_size)
+                            
+                            # This groups batch indices by block_id.
+                            # For decode, each block will have only one new token.
+                            # This function is being documented in English.
+                            groups = {}
+                            for i in range(local_idx.numel()):
+                                bi = int(block_ids[i].item())
+                                groups.setdefault(bi, []).append(i)
+
+                            layer_idx = int(getattr(self, "kvtuner_layer_idx", 0))
+                            from vllm.v1.pool.kv_meta import parse_kv_meta
+
+                            for b, indices_in_group in groups.items():
+                                # Find the maximum offset written to this block in the current step.
+                                # This tells us the new total number of tokens in the block.
+                                # This function is being documented in English.
+                                new_token_offsets = offs_in_block[torch.tensor(indices_in_group, device=offs_in_block.device)]
+                                num_tokens_in_block = new_token_offsets.max().item() + 1
+                                
+                                # Retrieve the full, updated history from the working cache.
+                                # This function is being documented in English.
+                                full_k_history = key_cache[b, :num_tokens_in_block].contiguous()
+                                full_v_history = value_cache[b, :num_tokens_in_block].contiguous()
+
+                                # Re-quantize the entire history and overwrite the storage.
+                                # This function is being documented in English.
+                                pk = kv_quantizer.quantize_k(layer_idx, full_k_history)
+                                pv = kv_quantizer.quantize_v(layer_idx, full_v_history)
+
+                                # --- START: FIX ---
+                                # ISSUE: `np.frombuffer` on a bytes object creates a read-only view,
+                                # triggering a UserWarning and indicating fragile memory handling.
+                                # FIX: Add `.copy()` to create a writable numpy array, resolving the
+                                # warning and making the buffer handling more robust.
+                                k_meta_np = np.frombuffer(pk.meta_bytes, dtype=np.uint8).copy()
+                                v_meta_np = np.frombuffer(pv.meta_bytes, dtype=np.uint8).copy()
+                                k_meta = torch.from_numpy(k_meta_np).to(device=key_cache.device)
+                                v_meta = torch.from_numpy(v_meta_np).to(device=value_cache.device)
+                                # --- END: FIX ---
+                                
+                                # Parse for fp16/bf16 scale/zp tensors
+                                k_md = parse_kv_meta(pk.meta_bytes, device=key_cache.device)
+                                v_md = parse_kv_meta(pv.meta_bytes, device=value_cache.device)
+
+                                coord.block_pool.write_k_tail(
+                                    int(b),
+                                    packed=pk.packed.to(torch.uint8),
+                                    meta=k_meta.to(torch.uint8),
+                                    scale=k_md["scale"],
+                                    zp=k_md["zp"],
+                                )
+                                coord.block_pool.write_v_tail(
+                                    int(b),
+                                    packed=pv.packed.to(torch.uint8),
+                                    meta=v_meta.to(torch.uint8),
+                                    scale=v_md["scale"],
+                                    zp=v_md["zp"],
+                                )
+            except Exception as _e:
+                import sys
+                print(f"[KVTuner:write-after-attn][WARN] {type(_e).__name__}: {_e}", file=sys.stderr)
+            # --- END KVTuner write-after-attention ---
             return output
 
         # Cascade attention (rare case).

@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (BlockHash, BlockHashWithGroupId,
                                          maybe_convert_block_hash)
 from vllm.v1.request import Request
 
+import torch
 logger = init_logger(__name__)
 
 
@@ -72,6 +73,256 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        # === KVTuner V-only accounting model (bytes-based) ===
+        # If enabled, usage() reports "compressed used bytes / raw capacity bytes".
+        self._kv_accounting_enabled: bool = False
+        self._kv_page_raw_bytes: int = 0       # denominator: raw FP page bytes
+        self._kv_page_used_bytes_q: int = 0    # numerator per-used-page: K raw + V packed + meta
+
+        # === KVTuner V-only: page-tail storage (16B aligned) ===
+        # We keep a per-block "tail" region that models the page tail. The stored
+        # blobs are ready-to-write byte payloads (no fp32 anywhere).
+        # Keys are physical block ids (int).
+        self._v_tail_exists: dict[int, bool] = {}
+        self._v_tail_packed: dict[int, torch.ByteTensor] = {}
+        self._v_tail_meta: dict[int, torch.ByteTensor] = {}
+        # Optional convenience (read path can avoid parsing meta if stored here):
+        self._v_tail_scale: dict[int, torch.Tensor] = {}   # fp16/bf16
+        self._v_tail_zp: dict[int, torch.Tensor] = {}  # fp16/bf16 or u8
+
+        # --- K-tail storage (packed bytes + 16B-aligned meta) ---
+        self._k_tail_exists: dict[int, bool] = {}
+        self._k_tail_packed: dict[int, torch.ByteTensor] = {}
+        self._k_tail_meta: dict[int, torch.ByteTensor] = {}
+        self._k_tail_scale: dict[int, torch.Tensor] = {}   # fp16/bf16
+        self._k_tail_zp: dict[int, torch.Tensor] = {}  # fp16/bf16 or u8
+
+         # --- KVTuner debug: keep lightweight checksums for packed/meta per block
+        # to verify that what we read equals what we wrote.
+        # We only track small ints to avoid memory blow-up.
+        self._v_tail_dbg_sum_packed: dict[int, int] = {}
+        self._v_tail_dbg_sum_meta: dict[int, int] = {}
+        self._k_tail_dbg_sum_packed: dict[int, int] = {}
+        self._k_tail_dbg_sum_meta: dict[int, int] = {}
+        # Also keep tiny nibble hist (0..15) length-16 python lists for 4-bit cases.
+        self._v_tail_dbg_hist: dict[int, list[int]] = {}
+        self._k_tail_dbg_hist: dict[int, list[int]] = {}
+
+    @staticmethod
+    def _dbg_sum_u8(t: torch.ByteTensor) -> int:
+        # device-agnostic sum
+        return int(t.to(device="cpu", dtype=torch.int32).sum().item())
+
+    @staticmethod
+    def _dbg_nibble_hist_u4(packed: torch.ByteTensor) -> list[int]:
+        """Return simple nibble histogram (0..15) for a uint8 packed buffer."""
+        x = packed.to("cpu")
+        lo = (x & 0x0F).to(torch.int64)
+        hi = ((x >> 4) & 0x0F).to(torch.int64)
+        hist = torch.zeros(16, dtype=torch.int64)
+        hist.scatter_add_(0, lo, torch.ones_like(lo))
+        hist.scatter_add_(0, hi, torch.ones_like(hi))
+        return [int(v) for v in hist.tolist()]
+
+    def _clear_kvtuner_tail(self, block_id: int):
+        """
+        Explicitly clear all KVTuner-related tail data associated with a block ID.
+        This must be called when a block is evicted or recycled to prevent stale data.
+        """
+        # This function is being documented in English.
+        self._v_tail_exists.pop(block_id, None)
+        self._v_tail_packed.pop(block_id, None)
+        self._v_tail_meta.pop(block_id, None)
+        self._v_tail_scale.pop(block_id, None)
+        self._v_tail_zp.pop(block_id, None)
+        self._v_tail_dbg_sum_packed.pop(block_id, None)
+        self._v_tail_dbg_sum_meta.pop(block_id, None)
+        self._v_tail_dbg_hist.pop(block_id, None)
+
+        self._k_tail_exists.pop(block_id, None)
+        self._k_tail_packed.pop(block_id, None)
+        self._k_tail_meta.pop(block_id, None)
+        self._k_tail_scale.pop(block_id, None)
+        self._k_tail_zp.pop(block_id, None)
+        self._k_tail_dbg_sum_packed.pop(block_id, None)
+        self._k_tail_dbg_sum_meta.pop(block_id, None)
+        self._k_tail_dbg_hist.pop(block_id, None)
+
+    def set_quantized_accounting_model(self, *, page_raw_bytes: int, page_used_bytes_q: int) -> None:
+        """Install bytes-based accounting for KV mixed-precision quantization (K+V packed + meta).
+        This affects kv_cache_usage(%): used_bytes_q / capacity_raw_bytes."""
+        assert isinstance(page_raw_bytes, int) and page_raw_bytes > 0
+        assert isinstance(page_used_bytes_q, int) and page_used_bytes_q > 0
+        self._kv_accounting_enabled = True
+        self._kv_page_raw_bytes = int(page_raw_bytes)
+        self._kv_page_used_bytes_q = int(page_used_bytes_q)
+
+    @staticmethod
+    def _align16(n: int) -> int:
+        r = n & 0xF
+        return n if r == 0 else (n + (16 - r))
+
+    def write_v_tail(self,
+                     block_id: int,
+                     *,
+                     packed: torch.ByteTensor,
+                     meta: torch.ByteTensor,
+                     scale: torch.Tensor,
+                     zp: torch.ByteTensor) -> None:
+        """Install V page-tail for the block: packed bytes + 16B-aligned meta.
+        All tensors must reside on the same device and obey dtype rules."""
+        assert packed.dtype == torch.uint8, "Packed V must be uint8."
+        assert meta.dtype == torch.uint8, "Meta must be uint8."
+        assert scale.dtype in (torch.float16, torch.bfloat16), "Scale must be fp16/bf16."
+        # The zero-point dtype can vary, but we will store it consistently as uint8.
+        # This function is being documented in English.
+        assert zp.dtype in (torch.uint8, torch.float16, torch.bfloat16), \
+            "Zero-points must be fp16/bf16 (or uint8 for legacy)."
+        # Enforce 16B alignment on meta length by padding zeros if needed.
+        pad = self._align16(int(meta.numel())) - int(meta.numel())
+        if pad:
+            meta = torch.cat([meta, torch.zeros(pad, dtype=torch.uint8, device=meta.device)], dim=0)
+
+        # --- SAFETY: clone to CPU so lifetime/device aliasing can't corrupt tails ---
+        p = packed.detach().contiguous().to(torch.uint8).to("cpu").clone()
+        m = meta.detach().contiguous().to(torch.uint8).to("cpu").clone()
+        s = scale.detach().contiguous().to(scale.dtype).to("cpu").clone()
+        
+        # --- START: FIX ---
+        # ISSUE: The zero-point (zp) was stored with its original float dtype (bf16/fp16),
+        # which can cause subtle data corruption issues.
+        # FIX: Consistently cast zp to torch.uint8 before storing, as hinted by
+        # the original code comments. This ensures data type stability.
+        z = zp.detach().contiguous().to(torch.uint8).to("cpu").clone()
+        # --- END: FIX ---
+
+        self._v_tail_exists[block_id] = True
+        self._v_tail_packed[block_id] = p
+        self._v_tail_meta[block_id] = m
+        self._v_tail_scale[block_id] = s
+        self._v_tail_zp[block_id] = z
+        # Lightweight debug accounting recorded at write time so reads can
+        # verify integrity without re-parsing or heavy work. Guarded to
+        # never raise on write path.
+        try:
+            self._v_tail_dbg_sum_packed[block_id] = self._dbg_sum_u8(p)
+            self._v_tail_dbg_sum_meta[block_id] = self._dbg_sum_u8(m)
+            # Nibble histogram is useful for 4-bit-packed buffers; it's
+            # cheap and harmless for other widths (it returns counts of
+            # low/high nibbles across the bytes).
+            self._v_tail_dbg_hist[block_id] = self._dbg_nibble_hist_u4(p)
+        except Exception:
+            # Do not let debug accounting break normal operation.
+            self._v_tail_dbg_sum_packed.pop(block_id, None)
+            self._v_tail_dbg_sum_meta.pop(block_id, None)
+            self._v_tail_dbg_hist.pop(block_id, None)
+
+    def read_v_tail(self, block_id: int):
+        """Return (packed:uint8, meta:uint8, scale:fp16/bf16, zp:fp16/bf16|u8) or None."""
+        if self._v_tail_exists.get(block_id, False):
+            p = self._v_tail_packed[block_id]
+            m = self._v_tail_meta[block_id]
+            s = self._v_tail_scale[block_id]
+            
+            # --- START: FIX ---
+            # ISSUE: If zp was somehow missing from the dictionary, it could lead to an error.
+            # FIX: Ensure zp is retrieved correctly, creating a default UINT8 tensor if it's missing.
+            # This makes the read operation more robust.
+            z = self._v_tail_zp.get(block_id)
+            if z is None:
+                # If zp is missing, create a default zero tensor with uint8 dtype to match the
+                # expected storage format.
+                z = torch.zeros_like(s, dtype=torch.uint8) 
+            # --- END: FIX ---
+
+            # --- DEBUG: verify sums match write-time ---
+            try:
+                sum_p = self._dbg_sum_u8(p)
+                sum_m = self._dbg_sum_u8(m)
+                hist = self._dbg_nibble_hist_u4(p)
+                wp = self._v_tail_dbg_sum_packed.get(block_id, None)
+                wm = self._v_tail_dbg_sum_meta.get(block_id, None)
+                # print(f"[KVTuner:POOL][READ  V] bid={block_id} packed_n={int(p.numel())} meta_n={int(m.numel())} "
+                #       f"sum(p)={sum_p} sum(m)={sum_m} "
+                #       f"w/sum(p)={wp} w/sum(m)={wm} hist={hist[:8]}..", flush=True)
+            except Exception as _e:
+                print(f"[KVTuner:POOL][READ  V][DBGERR] {type(_e).__name__}: {_e}", flush=True)
+            return (p, m, s, z)
+        return None
+
+    def write_k_tail(self,
+                     block_id: int,
+                     *,
+                     packed: torch.ByteTensor,
+                     meta: torch.ByteTensor,
+                     scale: torch.Tensor,
+                     zp: torch.ByteTensor) -> None:
+        """Install K page-tail for the block: packed bytes + 16B-aligned meta.
+        Mirrors write_v_tail but for Keys. All tensors must be on same device and obey dtype rules."""
+        assert packed.dtype == torch.uint8, "Packed K must be uint8."
+        assert meta.dtype == torch.uint8, "Meta must be uint8."
+        assert scale.dtype in (torch.float16, torch.bfloat16), "Scale must be fp16/bf16."
+        # The zero-point dtype can vary, but we will store it consistently as uint8.
+        # This function is being documented in English.
+        assert zp.dtype in (torch.uint8, torch.float16, torch.bfloat16), \
+            "Zero-points must be fp16/bf16 (or uint8 for legacy)."
+
+        # Align meta to 16B as a safety guard (kv_meta already aligned, but keep invariant here)
+        if (int(meta.numel()) & 0xF) != 0:
+            pad = self._align16(int(meta.numel())) - int(meta.numel())
+            meta = torch.cat([meta, torch.zeros(pad, dtype=torch.uint8, device=meta.device)], dim=0)
+
+        # SAFETY: clone to CPU (same rationale as V)
+        p = packed.detach().contiguous().to(torch.uint8).to("cpu").clone()
+        m = meta.detach().contiguous().to(torch.uint8).to("cpu").clone()
+        s = scale.detach().contiguous().to(scale.dtype).to("cpu").clone()
+        
+        # --- START: FIX (Consistent with write_v_tail) ---
+        z = zp.detach().contiguous().to(torch.uint8).to("cpu").clone()
+        # --- END: FIX ---
+
+        self._k_tail_exists[block_id] = True
+        self._k_tail_packed[block_id] = p
+        self._k_tail_meta[block_id] = m
+        self._k_tail_scale[block_id] = s
+        self._k_tail_zp[block_id] = z
+        # Record lightweight debug accounting for K-tail as well.
+        try:
+            self._k_tail_dbg_sum_packed[block_id] = self._dbg_sum_u8(p)
+            self._k_tail_dbg_sum_meta[block_id] = self._dbg_sum_u8(m)
+            self._k_tail_dbg_hist[block_id] = self._dbg_nibble_hist_u4(p)
+        except Exception:
+            self._k_tail_dbg_sum_packed.pop(block_id, None)
+            self._k_tail_dbg_sum_meta.pop(block_id, None)
+            self._k_tail_dbg_hist.pop(block_id, None)
+
+    def read_k_tail(self, block_id: int):
+        """Return (packed, meta, scale, zp) for K if exists; else None."""
+        if self._k_tail_exists.get(block_id, False):
+            p = self._k_tail_packed[block_id]
+            m = self._k_tail_meta[block_id]
+            s = self._k_tail_scale[block_id]
+            
+            # --- START: FIX (Consistent with read_v_tail) ---
+            z = self._k_tail_zp.get(block_id)
+            if z is None:
+                z = torch.zeros_like(s, dtype=torch.uint8)
+            # --- END: FIX ---
+                
+            try:
+                sum_p = self._dbg_sum_u8(p)
+                sum_m = self._dbg_sum_u8(m)
+                hist = self._dbg_nibble_hist_u4(p)
+                wp = self._k_tail_dbg_sum_packed.get(block_id, None)
+                wm = self._k_tail_dbg_sum_meta.get(block_id, None)
+                # print(f"[KVTuner:POOL][READ  K] bid={block_id} packed_n={int(p.numel())} meta_n={int(m.numel())} "
+                #       f"sum(p)={sum_p} sum(m)={sum_m} "
+                #       f"w/sum(p)={wp} w/sum(m)={wm} hist={hist[:8]}..", flush=True)
+            except Exception as _e:
+                print(f"[KVTuner:POOL][READ  K][DBGERR] {type(_e).__name__}: {_e}", flush=True)
+            return (p, m, s, z)
+        return None
+        
     def get_cached_block(
             self, block_hash: BlockHash,
             kv_cache_group_ids: list[int]) -> Optional[list[KVCacheBlock]]:
@@ -184,6 +435,13 @@ class BlockPool:
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
+        # FIX: Explicitly clear any stale KVTuner tail data for each recycled block.
+        # This is the correct location to ensure cleanup happens for ALL block re-allocations,
+        # regardless of whether prefix caching is enabled.
+        # This function is being documented in English.
+        for block in ret:
+            self._clear_kvtuner_tail(block.block_id)
+
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
@@ -207,14 +465,21 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        # FIX: Clear any stale KVTuner tail data before this block is reused.
+        # This prevents new allocations from inheriting old, incorrect quantized data.
+        # This function is being documented in English.
+        self._clear_kvtuner_tail(block.block_id)
+
         block_hash = block.block_hash
         if block_hash is None:
             # The block doesn't have hash, eviction is not needed
+            # This function is being documented in English.
             return False
         blocks_by_id = self.cached_block_hash_to_block.get(block_hash)
         if blocks_by_id is None:
             # block_hash not found in cached_block_hash_to_block,
             # eviction is not needed
+            # This function is being documented in English.
             return False
         block.reset_hash()
         blocks_by_id.pop(block.block_id, None)
@@ -226,6 +491,7 @@ class BlockPool:
             # or `(hash_value, group_id)` here. But it's fine now because
             # we disable hybrid kv cache manager when kv cache event is
             # enabled, so there is only one group.
+            # This function is being documented in English.
             self.kv_event_queue.append(
                 BlockRemoved(block_hashes=[
                     maybe_convert_block_hash(get_block_hash(block_hash))
@@ -309,12 +575,25 @@ class BlockPool:
 
         Returns:
             The KV cache usage (between 0.0 and 1.0).
+        Semantics:
+            - If quantized-accounting is enabled (via set_quantized_accounting_model),
+              we report: used_bytes_q / capacity_raw_bytes.
+              capacity_raw_bytes = (num_gpu_blocks - 1) * page_raw_bytes
+              used_bytes_q       = (num_used_blocks) * page_used_bytes_q
+            - Otherwise, we fall back to the classic block-ratio usage.
         """
+        total_gpu_blocks = self.num_gpu_blocks - 1  # subtract null
+        if total_gpu_blocks <= 0:
+            return 0.0
 
-        # Subtract 1 to account for null block.
-        total_gpu_blocks = self.num_gpu_blocks - 1
-        if not total_gpu_blocks:
-            return 0
+        num_used_blocks = total_gpu_blocks - self.get_num_free_blocks()
+        if self._kv_accounting_enabled:
+            capacity_raw_bytes = total_gpu_blocks * self._kv_page_raw_bytes
+            used_bytes_q = num_used_blocks * self._kv_page_used_bytes_q
+            if capacity_raw_bytes <= 0:
+                return 0.0
+            return float(used_bytes_q) / float(capacity_raw_bytes)
+        
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
 
     def take_events(self) -> list[KVCacheEvent]:

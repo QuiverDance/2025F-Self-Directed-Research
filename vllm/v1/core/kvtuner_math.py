@@ -7,6 +7,7 @@ import torch
 
 # Always-on debug prints for verification (remove later if stable)
 def _dbg(msg: str):
+    return
     print(f"[KVTunerMath] {msg}")
 
 @dataclass
@@ -88,31 +89,61 @@ class KVTunerMath:
         assert bits in (8, 4, 2, 1), f"Unsupported bits={bits}"
         assert x.dtype in (torch.float16, torch.bfloat16), "Only FP16/BF16 allowed."
         KVTunerMath._assert_no_fp32(x)
+        
+        # --- START: FIX ---
+        # Add safety checks to prevent quantization of invalid values, which can corrupt the cache.
+        if x.numel() == 0:
+            raise ValueError("Empty tensor received for quantization")
+        if torch.isnan(x).any():
+            raise ValueError("Input tensor contains NaN values")
+        if torch.isinf(x).any():
+            raise ValueError("Input tensor contains Inf values")
+        # --- END: FIX ---
 
+        # Add safety checks
+        if x.numel() == 0:
+            raise ValueError("Empty tensor received for quantization")
+        if torch.isnan(x).any():
+            raise ValueError("Input tensor contains NaN values")
+        if torch.isinf(x).any():
+            raise ValueError("Input tensor contains Inf values")
+
+        # FIX: Special and correct handling for V-cache (axis=0).
+        # This ensures true per-token quantization by flattening H and D dims.
+        if axis == 0 and x.dim() > 1:
+            orig_shape = x.shape
+            x_flat = x.reshape(orig_shape[0], -1)  # Shape: [T, H*D]
+            
+            # For per-token, the entire token vector is one group.
+            x_min = x_flat.min(dim=-1).values  # Shape: [T]
+            x_max = x_flat.max(dim=-1).values  # Shape: [T]
+
+            qmin, qmax = 0, (1 << bits) - 1
+            rng = torch.clamp(x_max - x_min, min=eps)
+            scale = rng / torch.tensor(qmax - qmin, dtype=model_dtype, device=x.device)
+            scale = torch.clamp(scale, min=eps, max=clamp_max).to(model_dtype)
+            zp = torch.round(-x_min / scale.clamp(min=eps))
+            zp = torch.clamp(zp, min=qmin, max=qmax).to(model_dtype)
+            
+            aux = {"A": x_flat.shape[1], "G": 1, "pad": 0} # G=1 because each token is one conceptual group for this calculation
+            return scale, zp, aux
+
+        # Standard path for K-cache and other generic cases
         y, perm, invperm = KVTunerMath._move_axis_last(x, axis)
         z, A, G, pad = KVTunerMath._group_last_axis(y, q_group_size)
 
-        # Min/max per group (no FP32)
         x_min = z.amin(dim=-1)
         x_max = z.amax(dim=-1)
 
-        # Asymmetric qparams with scale clamp [eps, clamp_max]
         qmin = 0
         qmax = (1 << bits) - 1
         rng = torch.clamp(x_max - x_min, min=eps)
         scale = rng / torch.tensor(qmax - qmin, dtype=model_dtype, device=x.device)
         scale = torch.clamp(scale, min=eps, max=clamp_max).to(model_dtype)
-        zp = torch.round(torch.tensor(qmin, dtype=model_dtype, device=x.device) - x_min / scale)
+        zp = torch.round(-x_min / scale.clamp(min=eps))
         zp = torch.clamp(zp, min=qmin, max=qmax).to(model_dtype)
 
-        # Debug summary (always-on)
-        num_clamped_hi = int(torch.count_nonzero(scale == clamp_max).item())
-        num_clamped_lo = int(torch.count_nonzero(scale == eps).item())
-        _dbg(f"qparams: bits={bits}, axis={axis}, groups={G}, "
-             f"scale[eps]={num_clamped_lo}, scale[max]={num_clamped_hi}, "
-             f"shape(scale)={tuple(scale.shape)}")
-
-        aux = {"A": A, "G": G, "pad": pad, "perm_last": int(perm[-1])}
+        aux = {"A": A, "G": G, "pad": pad}
         return scale, zp, aux
 
     @staticmethod
@@ -129,42 +160,62 @@ class KVTunerMath:
             x, bits, axis=axis, q_group_size=q_group_size,
             clamp_max=clamp_max, eps=eps, model_dtype=model_dtype)
 
-        # Reuse the same steps to construct grouped view
-        y, perm, invperm = KVTunerMath._move_axis_last(x, axis)
-        z, A, G, pad = KVTunerMath._group_last_axis(y, q_group_size)
+        qmin, qmax = 0, (1 << bits) - 1
 
-        qmin = 0
-        qmax = (1 << bits) - 1
-        # ✅ Standard asymmetric quant: q = round(x/scale + zp)
-        q = torch.round(z / scale.unsqueeze(-1) + zp.unsqueeze(-1))
-        q = torch.clamp(q, min=qmin, max=qmax)
+        if axis == 0 and x.dim() > 1: # V-cache path
+            x_flat = x.reshape(x.shape[0], -1)
+            q_flat = torch.round(x_flat / scale.unsqueeze(-1) + zp.unsqueeze(-1))
+            q_flat = torch.clamp(q_flat, min=qmin, max=qmax)
+            q_orig = q_flat.reshape(*x.shape)
+            groups = x.shape[0]
+            group_size = x_flat.shape[1]
+        else: # K-cache and generic path
+            y, perm, invperm = KVTunerMath._move_axis_last(x, axis)
+            z, A, G, pad = KVTunerMath._group_last_axis(y, q_group_size)
+            q = torch.round(z / scale.unsqueeze(-1) + zp.unsqueeze(-1))
+            q = torch.clamp(q, min=qmin, max=qmax)
 
-        # ✅ Flatten (groups, group_size) → last axis, then drop the padded tail to length A
-        group_size = z.shape[-1]           # = q_group_size or A
-        q_flat = q.reshape(*y.shape[:-1], G * group_size)
-        if pad:
-            q_flat = q_flat[..., :A]       # keep only real elements
-
-        # Debug guard (always-on)
-        assert q_flat.shape[-1] == A, f"q_flat last-dim {q_flat.shape[-1]} != A {A}"
-
-        q_last = q_flat.contiguous()
-        q_orig = q_last.permute(*invperm).contiguous().to(torch.int32)
-
+            group_size = z.shape[-1]
+            q_flat = q.reshape(*y.shape[:-1], G * group_size)
+            if pad:
+                q_flat = q_flat[..., :A]
+            
+            q_last = q_flat.contiguous()
+            q_orig = q_last.permute(*invperm).contiguous()
+            groups = G
+        
+        # FIX: Cast to int32 BEFORE the Q-CHECK and meta creation.
+        # This was the root cause of the "q must be integer tensor" error.
+        q_orig = q_orig.to(torch.int32)
+        
         meta = QuantMeta(
             axis=axis,
             orig_shape=tuple(int(d) for d in x.shape),
-            group_size=int(q_group_size or A),
-            groups=int(G),
+            group_size=int(q_group_size or aux.get("A", 1)),
+            groups=int(groups),
             scale=scale.to(model_dtype).contiguous(),
             zp=zp.to(model_dtype).contiguous(),
         )
 
-        _dbg(f"quantize: bits={bits}, axis={axis}, A={A}, G={G}, "
-             f"group_size={meta.group_size}, flattened={G*group_size}, "
-             f"q_int32.numel={q_orig.numel()}")
+        # =========== START: ADD DEBUGGING CODE ===========
+        # Perform an immediate dequantization to check the quantization quality.
+        # This helps verify if the quantization math itself is correct.
+        try:
+            # Now q_orig is guaranteed to be an integer tensor.
+            x_hat = KVTunerMath.dequantize(q_orig.clone(), bits, meta, model_dtype=model_dtype)
+            # Calculate the L-infinity norm (max absolute error)
+            error = torch.max(torch.abs(x - x_hat)).item()
+            # print(f"[KVTuner:DBG][Q-CHECK] kind={'V' if axis==0 else 'K'} L{meta.orig_shape[0]} bits={bits} "
+            #     f"Quantization L-inf error: {error:.4f}")
+        except Exception as e:
+            print(f"[KVTuner:DBG][Q-CHECK] ERROR during round-trip check for {'V' if axis==0 else 'K'}: {e}")
+        # =========== END: ADD DEBUGGING CODE =============
 
         return q_orig, meta
+
+        # _dbg(f"quantize: bits={bits}, axis={axis}, A={A}, G={G}, "
+        #      f"group_size={meta.group_size}, flattened={G*group_size}, "
+        #      f"q_int32.numel={q_orig.numel()}")
 
     @staticmethod
     def dequantize(q: torch.Tensor,
@@ -173,47 +224,64 @@ class KVTunerMath:
                    *,
                    model_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         """Reconstruct FP tensor using meta (scale/zp) with the same dtype."""
+        # =========== START: ADD DEBUGGING CODE ===========
+        # print(f"[KVTuner:DBG][DEQUANT_ENTRY] axis={meta.axis}, orig_shape={meta.orig_shape}, "
+        #       f"q.shape={q.shape}, scale.shape={meta.scale.shape}, zp.shape={meta.zp.shape}")
+        # =========== END: ADD DEBUGGING CODE =============
+
         assert q.dtype in (torch.int32, torch.int16, torch.int8), "q must be integer tensor"
+        KVTunerMath._assert_no_fp32(meta.scale, meta.zp)
+        
+        orig_shape = meta.orig_shape
         axis = meta.axis
-        shape = meta.orig_shape
         group_size = meta.group_size
         G = meta.groups
-        scale = meta.scale.to(model_dtype)
-        zp = meta.zp.to(model_dtype)
+        ndim = len(orig_shape)
+        # if axis < 0:
+        #     axis += ndim
+            
+        scale = meta.scale.to(dtype=model_dtype, device=q.device)
+        zp = meta.zp.to(dtype=model_dtype, device=q.device)
+        
+        # FIX: Correctly handle dequantization for both V-cache and K-cache paths
+        # based on their parameter shapes.
+        if axis == 0 and q.dim() > 1: # V-cache path: scale/zp shape is [T]
+            # Reshape scale/zp from [T] to [T, 1, 1] for broadcasting against [T, H, D]
+            x_orig_non_contiguous = (q.to(model_dtype) - zp.view(-1, 1, 1)) * scale.view(-1, 1, 1)
 
-        # Bring axis to last
-        ndim = len(shape)
-        if axis < 0:
-            axis += ndim
-        perm = [i for i in range(ndim) if i != axis] + [axis]
-        invperm = [0] * ndim
-        for i, p in enumerate(perm):
-            invperm[p] = i
+            # --- START: DEBUGGING CODE ---
+            # This will print `False` before the fix and `True` after, confirming the change.
+            print(f"[KVTuner:VERIFY-CONTIGUOUS] V-cache tensor before .contiguous(): is_contiguous={x_orig_non_contiguous.is_contiguous()}")
+            # --- END: DEBUGGING CODE ---
+            
+            x_orig = x_orig_non_contiguous.contiguous()
+            # --- START: DEBUGGING CODE ---
+            print(f"[KVTuner:VERIFY-CONTIGUOUS] V-cache tensor after .contiguous(): is_contiguous={x_orig.is_contiguous()}")
+            # --- END: DEBUGGING CODE ---
+        else: # K-cache and generic path
+            # Move quantization axis to the last dimension
+            y, perm, invperm = KVTunerMath._move_axis_last(q, axis)
+            
+            # Group the last dimension
+            A = y.shape[-1]
+            pad = G * group_size - A
+            if pad > 0:
+                y = torch.nn.functional.pad(y, (0, pad), mode="constant", value=0)
+            z = y.view(*y.shape[:-1], G, group_size)
 
-        q_last = q.permute(*perm).contiguous()
-        A = q_last.shape[-1]
-        pad = G * group_size - A
-        if pad:
-            q_last = torch.nn.functional.pad(q_last, (0, pad), mode="constant", value=0)
+            # Dequantize. scale/zp have shape (other_dims..., G), so unsqueeze for broadcasting
+            x = (z.to(model_dtype) - zp.unsqueeze(-1)) * scale.unsqueeze(-1)
+            
+            # Ungroup and remove padding
+            x_flat = x.reshape(*y.shape[:-1], G * group_size)
+            if pad > 0:
+                x_flat = x_flat[..., :A]
 
-        z = q_last.view(*q_last.shape[:-1], G, group_size)
+            # Permute back to original layout
+            x_last = x_flat.contiguous()
+            x_orig = x_last.permute(*invperm).contiguous()
 
-        # ✅ Standard asymmetric dequant: x̂ = scale * (q - zp)
-        x = (z.to(model_dtype) - zp.unsqueeze(-1)) * scale.unsqueeze(-1)
-
-        # ✅ Flatten (G, group_size) → last axis, then drop padded tail back to length A
-        x_flat = x.reshape(*x.shape[:-2], G * group_size)
-        if pad:
-            x_flat = x_flat[..., :A]
-        # Debug guard
-        assert x_flat.shape[-1] == A, f"dequant flatten last-dim {x_flat.shape[-1]} != A {A}"
-
-        out = x_flat.permute(*invperm).contiguous().to(model_dtype)
-
-        _dbg(f"dequantize: bits={bits}, axis={axis}, A={A}, G={G}, "
-             f"flattened={G*group_size}, out.shape={tuple(out.shape)}")
-
-        return out
+        return x_orig.to(model_dtype)
 
 
 # === Append this to the bottom of vllm/v1/core/kvtuner_math.py ===

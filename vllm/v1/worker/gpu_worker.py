@@ -35,6 +35,9 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 
+from vllm.v1.core.kvtuner_quantizer import KVTunerQuantizer
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -198,9 +201,24 @@ class Worker(WorkerBase):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
-        # Construct the model runner
+        # --- KVTuner: build quantizer locally from config and inject (no globals) ---
+        qtz = None
+        kv_coord = None
+        add_cfg = getattr(self.vllm_config, "additional_config", {}) or {}
+        kvt_cfg = add_cfg.get("kvtuner_config", None)
+        if kvt_cfg is not None:
+            model_dtype = getattr(self.vllm_config.model_config, "dtype", torch.float16)
+            qtz = KVTunerQuantizer(kvt_cfg, model_dtype)
+            if getattr(qtz, "enable"):
+                from vllm.v1.core.kvtuner_quantizer import set_global_quantizer
+                set_global_quantizer(qtz)
+            else :
+                qtz = None
+        else:
+            print("[KVTuner][gpu_worker] quantizer=OFF", flush=True)
+
         self.model_runner: GPUModelRunner = GPUModelRunner(
-            self.vllm_config, self.device)
+            self.vllm_config, self.device, quantizer=qtz)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -307,7 +325,6 @@ class Worker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
-
         if self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
 

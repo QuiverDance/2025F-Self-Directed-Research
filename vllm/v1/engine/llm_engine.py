@@ -36,7 +36,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm._debug import dprint
 from vllm.v1.metrics.kv_request_meter import kv_meter
-from vllm.v1.core.kvtuner_quantizer import KVTunerQuantizer, set_global_quantizer
+from vllm.v1.core.kvtuner_quantizer import KVTunerQuantizer
 import os, json, torch
 
 logger = init_logger(__name__)
@@ -56,6 +56,7 @@ class LLMEngine:
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
         multiprocess_mode: bool = False,
+        quantizer: Optional[KVTunerQuantizer] = None,
     ) -> None:
         dprint('path', 'LLMEngine.__init__ start', executor=executor_class.__name__)
         if not envs.VLLM_USE_V1:
@@ -112,26 +113,6 @@ class LLMEngine:
                 "vllm.llm_engine",
                 self.observability_config.otlp_traces_endpoint)
             self.output_processor.tracer = tracer
-
-        # ---- KVTuner: Install quantizer BEFORE creating engine_core (so workers see ENV) ----
-        try:
-            add_cfg = getattr(vllm_config, "additional_config", {}) or {}
-            kvt_cfg = add_cfg.get("kvtuner_config", None)
-            if kvt_cfg:
-                # Try to get dtype early; fallback to fp16
-                model_dtype = getattr(getattr(vllm_config, "model_config", None), "dtype", torch.float16)
-                q = KVTunerQuantizer(kvt_cfg, model_dtype)
-                set_global_quantizer(q)
-                os.environ["VLLM_KVTUNER_CONFIG_JSON"] = json.dumps(kvt_cfg)
-                print("[KVTuner] Global quantizer installed (pre-core).")
-            else:
-                set_global_quantizer(None)
-                os.environ.pop("VLLM_KVTUNER_CONFIG_JSON", None)
-                print("[KVTuner] No kvtuner_config; quantizer disabled.")
-        except Exception as e:
-            set_global_quantizer(None)
-            os.environ.pop("VLLM_KVTUNER_CONFIG_JSON", None)
-            print("[KVTuner] Quantizer init failed (pre-core):", str(e))
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
         dprint('path', 'LLMEngine.__init__ creating EngineCore')

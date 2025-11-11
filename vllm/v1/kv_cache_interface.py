@@ -4,7 +4,7 @@
 import copy
 from dataclasses import dataclass, fields
 from math import prod
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 import torch
 from typing_extensions import Self

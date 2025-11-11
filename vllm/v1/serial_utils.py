@@ -393,3 +393,74 @@ class MsgpackDecoder:
 
         raise NotImplementedError(
             f"Extension type code {code} is not supported")
+
+
+# ======================= KVTuner helpers (Step-3) =======================
+# NOTE: Keep these tiny and torch-only; no FP32 math introduced here.
+import math
+
+def align16(n: int) -> int:
+    """Return n rounded up to the nearest multiple of 16."""
+    r = n % 16
+    return n if r == 0 else (n + (16 - r))
+
+def pack_nbits(vals: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack unsigned int tensor into uint8 buffer.
+    Convention: lower index -> lower bits (little-endian within a byte).
+    
+    Args:
+        vals: Input tensor with integer values to pack
+        bits: Number of bits per value (1, 2, 4, or 8)
+    
+    Returns:
+        Packed uint8 tensor
+        
+    Raises:
+        ValueError: If input values are outside valid range for bit width
+    """
+    # Input validation
+    assert vals.dtype in (torch.int8, torch.int16, torch.int32)
+    assert bits in (1, 2, 4, 8), f"Unsupported bits={bits}"
+    
+    # Check value ranges
+    qmin, qmax = 0, (1 << bits) - 1 
+    if vals.min() < qmin or vals.max() > qmax:
+        raise ValueError(f"Input values outside valid range [{qmin}, {qmax}] for {bits}-bit quantization")
+        
+    if bits == 8:
+        return vals.to(torch.uint8)
+        
+    # Calculate padding
+    per_byte = 8 // bits
+    n = vals.numel()
+    pad = (per_byte - (n % per_byte)) % per_byte
+    
+    # Apply padding if needed
+    if pad:
+        vals = torch.nn.functional.pad(vals, (0, pad), value=0)
+        
+    # Pack values
+    mask = (1 << bits) - 1
+    v = vals.view(-1, per_byte).to(torch.int32)
+    packed = torch.zeros(v.shape[0], dtype=torch.int32, device=vals.device)
+    
+    for i in range(per_byte):
+        packed |= (v[:, i] & mask) << (i * bits)
+        
+    return packed.to(torch.uint8)
+
+def unpack_nbits(buf: torch.Tensor, bits: int, out_numel: int) -> torch.Tensor:
+    """Inverse of pack_nbits."""
+    assert buf.dtype == torch.uint8
+    assert bits in (1, 2, 4, 8)
+    if bits == 8:
+        return buf.to(torch.int32)[:out_numel]
+    per_byte = 8 // bits
+    n_groups = (out_numel + per_byte - 1) // per_byte
+    b = buf[:n_groups].to(torch.int32)
+    outs = []
+    mask = (1 << bits) - 1
+    for i in range(per_byte):
+        outs.append((b >> (i * bits)) & mask)
+    out = torch.stack(outs, dim=1).reshape(-1)
+    return out[:out_numel]

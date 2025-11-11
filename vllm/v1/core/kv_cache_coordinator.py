@@ -11,6 +11,10 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.request import Request
 
+from vllm.v1.core.kvtuner_quantizer import KVTunerQuantizer
+from vllm.utils import get_dtype_size
+
+_GLOBAL_COORD: Optional["KVCacheCoordinator"] = None
 
 class KVCacheCoordinator(ABC):
     """
@@ -25,6 +29,7 @@ class KVCacheCoordinator(ABC):
         enable_caching: bool,
         enable_kv_cache_events: bool,
         dcp_world_size: int,
+        quantizer: Optional[KVTunerQuantizer] = None
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -32,6 +37,67 @@ class KVCacheCoordinator(ABC):
 
         self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
                                     enable_kv_cache_events)
+
+        # --- KVTuner KV bytes-based accounting (exact enough, no globals) ---
+        # usage% = used_bytes_q / capacity_raw_bytes
+        # capacity_raw_bytes = (num_blocks-1)*page_raw_bytes(raw K+V)
+        # used_bytes_q       = num_used_blocks*(K packed + V packed + meta(K)+meta(V))
+        self.kv_quantizer = quantizer
+        if quantizer is not None and getattr(quantizer, "enable") and len(kv_cache_config.kv_cache_groups) >= 1:
+            try:
+                spec0 = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+                if isinstance(spec0, FullAttentionSpec) and not spec0.use_mla:
+
+                    dtype_size = get_dtype_size(spec0.dtype)
+                    elems = spec0.block_size * spec0.num_kv_heads * spec0.head_size
+                    page_raw_bytes = int(spec0.page_size_bytes)  # raw K + raw V (denominator)
+
+                    # Bits per layer/group (use layer 0's group as representative)
+                    vbits = int(quantizer.get_bits(0, "v"))
+                    kbits = int(quantizer.get_bits(0, "k"))
+                    # Packed payload sizes
+                    v_packed = (elems * vbits + 7) // 8
+                    k_packed = (elems * kbits + 7) // 8
+                    # Meta bytes approximation (16B-aligned)
+                    #  V (axis=0): per row (token*head) have 1 group → (2B scale + 1B zp)
+                    meta_v_core = 16 + (spec0.block_size * spec0.num_kv_heads) * (2 + 1)
+                    meta_v_bytes = ((meta_v_core + 15) // 16) * 16
+                    #  K (axis=1, q_group_size=32): groups along head_size
+                    qgs = int(getattr(quantizer, "key_q_group_size", 32))
+                    g_per_row = (spec0.head_size + qgs - 1) // qgs
+                    meta_k_core = 16 + (spec0.block_size * spec0.num_kv_heads * g_per_row) * (2 + 1)
+                    meta_k_bytes = ((meta_k_core + 15) // 16) * 16
+                    page_used_bytes_q = int(k_packed + v_packed + meta_k_bytes + meta_v_bytes)
+
+                    # KVTUNER_DEBUG_START
+                    import os, sys
+                    try:
+                        print(f"[KVTuner:acct] pid={os.getpid()} "
+                              f"k_packed={k_packed} v_packed={v_packed} "
+                              f"meta_k={meta_k_bytes} meta_v={meta_v_bytes} "
+                              f"denom_raw={page_raw_bytes} used_q={page_used_bytes_q}",
+                              flush=True, file=sys.stderr)
+                    except Exception:
+                        pass
+                    # KVTUNER_DEBUG_END
+
+                    if page_raw_bytes > 0 and page_used_bytes_q > 0:
+
+                        self.block_pool.set_quantized_accounting_model(
+                            page_raw_bytes=page_raw_bytes,
+                            page_used_bytes_q=page_used_bytes_q)
+                        # Always-on debug
+                        print("[KVTuner][Coordinator] accounting installed",
+                              f"quantizer_id={id(quantizer)} dtype_size={dtype_size}",
+                              f"block_size={spec0.block_size} n_kv_heads={spec0.num_kv_heads} head_size={spec0.head_size}",
+                              f"elems={elems} kbits={kbits} vbits={vbits} "
+                              f"k_packed={k_packed} v_packed={v_packed} "
+                              f"meta_k={meta_k_bytes} meta_v={meta_v_bytes}",
+                              f"page_raw_bytes={page_raw_bytes} page_used_bytes_q={page_used_bytes_q}",
+                              flush=True)
+            except Exception as e:
+                print("[KVTuner][Coordinator] Warning: could not set quantized ")
+                pass
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
@@ -200,13 +266,15 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
                  use_eagle: bool, enable_kv_cache_events: bool,
-                 dcp_world_size: int):
+                 dcp_world_size: int,
+                 quantizer: Optional[KVTunerQuantizer] = None):
         super().__init__(kv_cache_config,
                          max_model_len,
                          use_eagle,
                          False,
                          enable_kv_cache_events,
-                         dcp_world_size=dcp_world_size)
+                         dcp_world_size=dcp_world_size,
+                         quantizer=quantizer)
         self.num_single_type_manager = len(self.single_type_managers)
 
     def get_num_common_prefix_blocks(self, request_id: str,
@@ -232,13 +300,15 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
                  use_eagle: bool, enable_caching: bool,
-                 enable_kv_cache_events: bool, dcp_world_size: int):
+                 enable_kv_cache_events: bool, dcp_world_size: int,
+                 quantizer: Optional[KVTunerQuantizer] = None):
         super().__init__(kv_cache_config,
                          max_model_len,
                          use_eagle,
                          enable_caching,
                          enable_kv_cache_events,
-                         dcp_world_size=dcp_world_size)
+                         dcp_world_size=dcp_world_size,
+                         quantizer=quantizer)
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[
             0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -276,13 +346,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
                  use_eagle: bool, enable_caching: bool,
-                 enable_kv_cache_events: bool, dcp_world_size: int):
+                 enable_kv_cache_events: bool, dcp_world_size: int,
+                 quantizer: Optional[KVTunerQuantizer] = None):
         super().__init__(kv_cache_config,
                          max_model_len,
                          use_eagle,
                          enable_caching,
                          enable_kv_cache_events,
-                         dcp_world_size=dcp_world_size)
+                         dcp_world_size=dcp_world_size,
+                         quantizer=quantizer)
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 
@@ -418,23 +490,57 @@ def get_kv_cache_coordinator(kv_cache_config: KVCacheConfig,
                              max_model_len: int, use_eagle: bool,
                              enable_caching: bool,
                              enable_kv_cache_events: bool,
-                             dcp_world_size: int) -> KVCacheCoordinator:
-    if not enable_caching:
-        return KVCacheCoordinatorNoPrefixCache(kv_cache_config,
-                                               max_model_len,
-                                               use_eagle,
-                                               enable_kv_cache_events,
-                                               dcp_world_size=dcp_world_size)
-    if len(kv_cache_config.kv_cache_groups) == 1:
-        return UnitaryKVCacheCoordinator(kv_cache_config,
-                                         max_model_len,
-                                         use_eagle,
-                                         enable_caching,
-                                         enable_kv_cache_events,
-                                         dcp_world_size=dcp_world_size)
-    return HybridKVCacheCoordinator(kv_cache_config,
-                                    max_model_len,
-                                    use_eagle,
-                                    enable_caching,
-                                    enable_kv_cache_events,
-                                    dcp_world_size=dcp_world_size)
+                             dcp_world_size: int,
+                             quantizer=None) -> KVCacheCoordinator:
+    """Factory that returns a process-local singleton coordinator.
+
+    Rules:
+      - caching OFF or no groups  -> NoPrefix
+      - all groups FullAttention  -> Unitary (even if >1 groups)
+      - mixed (full + other)      -> Hybrid
+    """
+    from vllm.v1.core.kvtuner_quantizer import get_global_quantizer
+    try:
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+    except Exception:
+        FullAttentionSpec = None  # fallback; shouldn't happen
+
+    global _GLOBAL_COORD
+    if _GLOBAL_COORD is not None:
+        return _GLOBAL_COORD
+
+    # Resolve quantizer
+    if quantizer is None:
+        quantizer = get_global_quantizer()
+
+    groups = getattr(kv_cache_config, "kv_cache_groups", []) or []
+    n_groups = len(groups)
+
+    # 1) No caching at all OR no groups -> NoPrefix
+    if not enable_caching or n_groups == 0:
+        _GLOBAL_COORD = KVCacheCoordinatorNoPrefixCache(
+            kv_cache_config, max_model_len, use_eagle,
+            enable_kv_cache_events, dcp_world_size=dcp_world_size,
+            quantizer=quantizer)
+        return _GLOBAL_COORD
+
+    # 2) All groups are FullAttention -> Unitary (even if >1)
+    all_full = (FullAttentionSpec is not None) and all(
+        isinstance(g.kv_cache_spec, FullAttentionSpec) for g in groups
+    )
+    if n_groups == 1 or all_full:
+        _GLOBAL_COORD = UnitaryKVCacheCoordinator(
+            kv_cache_config, max_model_len, use_eagle,
+            enable_caching, enable_kv_cache_events,
+            dcp_world_size=dcp_world_size, quantizer=quantizer)
+        return _GLOBAL_COORD
+
+    # 3) Mixed types -> Hybrid
+    _GLOBAL_COORD = HybridKVCacheCoordinator(
+        kv_cache_config, max_model_len, use_eagle,
+        enable_caching, enable_kv_cache_events,
+        dcp_world_size=dcp_world_size, quantizer=quantizer)
+    return _GLOBAL_COORD
+
+def get_global_coordinator() -> KVCacheCoordinator:
+    return _GLOBAL_COORD
